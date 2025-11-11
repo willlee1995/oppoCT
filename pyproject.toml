@@ -1,0 +1,18 @@
+[project]
+name = "lumbar-spine-ct-pipeline"
+version = "1.0.0"
+description = "Pipeline for segmenting lumbar vertebrae from CT scans and calculating HU intensity statistics"
+requires-python = ">=3.9"
+dependencies = [
+    "totalsegmentator>=2.0.0",
+    "pydicom>=2.4.0",
+    "nibabel>=5.0.0",
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
