@@ -1,0 +1,10 @@
+{
+    "vertebrae_body": {
+        "volume": 0.0,
+        "intensity": 0.0
+    },
+    "intervertebral_discs": {
+        "volume": 0.0,
+        "intensity": 0.0
+    }
+}

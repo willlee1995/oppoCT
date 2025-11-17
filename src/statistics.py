@@ -6,8 +6,10 @@ from segmentation masks.
 """
 
 import json
+import logging
 import numpy as np
 import nibabel as nib
+from scipy import ndimage
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -109,12 +111,59 @@ def calculate_patient_statistics(
             
             # Ensure mask and CT have same shape
             if mask.shape != ct_image.shape:
-                # Resample mask to match CT (simple approach - may need proper resampling)
-                print(f"Warning: Mask shape {mask.shape} doesn't match CT shape {ct_image.shape} for {vertebra}")
-                # Try to match by cropping/padding
-                min_shape = tuple(min(m, c) for m, c in zip(mask.shape, ct_image.shape))
-                mask = mask[:min_shape[0], :min_shape[1], :min_shape[2]]
-                ct_slice = ct_image[:min_shape[0], :min_shape[1], :min_shape[2]]
+                # TotalSegmentator resamples images internally, so masks are in resampled space
+                # Instead of resampling masks, resample CT to match mask space
+                # This preserves the mask shape as-is and works in TotalSegmentator's space
+                logging.info(f"Mask shape {mask.shape} doesn't match CT shape {ct_image.shape} for {vertebra}. Resampling CT to match mask space...")
+                
+                # Get spacings
+                mask_spacing = mask_nifti.header.get_zooms()[:3]
+                ct_spacing = ct_nifti.header.get_zooms()[:3]
+                
+                # Calculate resampling factors (CT to mask space)
+                zoom_factors = [c / m for c, m in zip(ct_spacing, mask_spacing)]
+                
+                # Resample CT to mask space using order=1 (linear interpolation for CT HU values)
+                ct_resampled = ndimage.zoom(ct_image, zoom_factors, order=1, mode='nearest')
+                
+                # If resampled CT is still different size, crop/pad to match mask
+                if ct_resampled.shape != mask.shape:
+                    # Calculate padding or cropping needed to match mask shape
+                    target_shape = mask.shape
+                    pad_before = []
+                    pad_after = []
+                    slices = []
+                    
+                    for i, (target_dim, resampled_dim) in enumerate(zip(target_shape, ct_resampled.shape)):
+                        if resampled_dim < target_dim:
+                            # Need padding
+                            diff = target_dim - resampled_dim
+                            pad_before.append(diff // 2)
+                            pad_after.append(diff - diff // 2)
+                            slices.append(slice(None))
+                        else:
+                            # Need cropping
+                            pad_before.append(0)
+                            pad_after.append(0)
+                            diff = resampled_dim - target_dim
+                            start = diff // 2
+                            slices.append(slice(start, start + target_dim))
+                    
+                    # Apply cropping first
+                    ct_resampled = ct_resampled[tuple(slices)]
+                    
+                    # Apply padding if needed
+                    if any(pb > 0 or pa > 0 for pb, pa in zip(pad_before, pad_after)):
+                        ct_resampled = np.pad(ct_resampled, 
+                                              list(zip(pad_before, pad_after)),
+                                              mode='constant', constant_values=0)
+                
+                # Use resampled CT and original mask (no mask resampling)
+                ct_slice = ct_resampled
+                # Update voxel spacing to mask spacing for volume calculation
+                if voxel_volume_mm3 is not None:
+                    mask_voxel_volume = np.prod(mask_spacing)
+                    voxel_volume_mm3 = mask_voxel_volume
             else:
                 ct_slice = ct_image
             

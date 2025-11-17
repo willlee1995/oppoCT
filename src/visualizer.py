@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from pathlib import Path
 from typing import List, Optional, Dict
+import logging
 
 # Lumbar vertebrae labels
 LUMBAR_VERTEBRAE = [
@@ -167,11 +168,10 @@ def create_patient_preview(
             if mask.shape == ct_image.shape:
                 segmentation_masks[vertebra] = mask
             else:
-                print(f"Warning: Mask shape {mask.shape} doesn't match CT shape {ct_image.shape} for {vertebra}")
-                # Try to match by cropping
-                min_shape = tuple(min(m, c) for m, c in zip(mask.shape, ct_image.shape))
-                mask_cropped = mask[:min_shape[0], :min_shape[1], :min_shape[2]]
-                segmentation_masks[vertebra] = mask_cropped
+                # Masks are in TotalSegmentator's resampled space
+                # For visualization, we'll use masks as-is and handle shape mismatch in display
+                logging.info(f"Mask shape {mask.shape} doesn't match CT shape {ct_image.shape} for {vertebra} - using mask as-is")
+                segmentation_masks[vertebra] = mask
     
     # Create preview
     output_path = output_dir / f"{patient_id}_preview.png"
