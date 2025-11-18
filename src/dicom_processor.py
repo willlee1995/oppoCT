@@ -73,19 +73,26 @@ def load_dicom_series(dicom_folder: Path) -> Tuple[np.ndarray, dict]:
     if hasattr(slices[0], 'ImagePositionPatient'):
         image_position = slices[0].ImagePositionPatient
     
-    # Extract pixel arrays
-    pixel_arrays = []
-    for slice_ds in slices:
+    # Get image dimensions from first slice
+    first_slice = slices[0]
+    rows = first_slice.Rows
+    cols = first_slice.Columns
+    num_slices = len(slices)
+    
+    # Initialize volume with correct shape: (Rows, Columns, Slices)
+    # This matches TotalSegmentator's expected format: (height, width, depth)
+    volume = np.zeros((rows, cols, num_slices), dtype=np.float32)
+    
+    # Load slices into volume
+    for i, slice_ds in enumerate(slices):
         pixel_array = slice_ds.pixel_array.astype(np.float32)
         
         # Apply rescale slope and intercept if present
         if hasattr(slice_ds, 'RescaleSlope') and hasattr(slice_ds, 'RescaleIntercept'):
             pixel_array = pixel_array * slice_ds.RescaleSlope + slice_ds.RescaleIntercept
         
-        pixel_arrays.append(pixel_array)
-    
-    # Stack into 3D array
-    volume = np.stack(pixel_arrays, axis=0)
+        # Assign to volume: (rows, cols, slice_index)
+        volume[:, :, i] = pixel_array
     
     # Create metadata dictionary
     metadata = {

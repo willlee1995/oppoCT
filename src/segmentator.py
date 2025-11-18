@@ -34,17 +34,21 @@ def segment_lumbar_vertebrae(
     output_dir: Path,
     fast: bool = False,
     device: str = 'gpu',
-    verbose: bool = True
+    verbose: bool = True,
+    use_dicom_directly: bool = False,
+    dicom_dir: Optional[Path] = None
 ) -> Path:
     """
     Segment lumbar vertebrae (L1-L5) from CT image using TotalSegmentator.
     
     Args:
-        nifti_path: Path to input NIfTI file
+        nifti_path: Path to input NIfTI file (or DICOM directory if use_dicom_directly=True)
         output_dir: Directory to save segmentation masks
         fast: Use fast mode (lower quality, faster processing)
         device: Device to use ('gpu' or 'cpu')
         verbose: Print progress messages
+        use_dicom_directly: If True, pass DICOM directory directly to TotalSegmentator (recommended)
+        dicom_dir: Path to DICOM directory (required if use_dicom_directly=True)
         
     Returns:
         Path to output directory containing segmentation masks
@@ -53,60 +57,36 @@ def segment_lumbar_vertebrae(
     output_dir.mkdir(parents=True, exist_ok=True)
     
     if verbose:
-        logging.info(f"Segmenting lumbar vertebrae from {nifti_path}")
+        if use_dicom_directly and dicom_dir:
+            logging.info(f"Segmenting lumbar vertebrae from DICOM directory: {dicom_dir}")
+        else:
+            logging.info(f"Segmenting lumbar vertebrae from NIfTI: {nifti_path}")
         logging.info(f"Output directory: {output_dir}")
     
     # Determine if preview can be enabled (Linux/WSL supports it, Windows native doesn't)
     enable_preview = platform.system() != 'Windows'
     
     try:
-        # Try with roi_subset first (more memory efficient)
-        # If it fails with empty crops, fall back to full image segmentation
-        try:
+        if verbose:
+            logging.info("Segmenting vertebrae_body using TotalSegmentator...")
+        
+        # Use DICOM directory directly if requested (matches CLI behavior)
+        if use_dicom_directly and dicom_dir:
+            input_path = str(dicom_dir)
             if verbose:
-                logging.info("Attempting segmentation with ROI subset for lumbar vertebrae...")
-            totalsegmentator(
-                input=str(nifti_path),
-                output=str(output_dir),
-                roi_subset=LUMBAR_VERTEBRAE,
-                fast=fast,
-                device=device,
-                verbose=verbose,
-                preview=enable_preview  # Enable preview on Linux/WSL, disable on Windows native
-            )
-            
-            # Check if we got any non-empty masks
-            found_vertebrae = verify_segmentation_output(output_dir)
-            if len(found_vertebrae) == 0:
-                if verbose:
-                    logging.warning("ROI subset produced empty masks. Falling back to full image segmentation...")
-                raise ValueError("Empty masks from ROI subset")
-            else:
-                if verbose:
-                    logging.info(f"Successfully segmented {len(found_vertebrae)} vertebrae using ROI subset")
-        except (ValueError, RuntimeError) as roi_error:
-            # Fall back to full image segmentation if ROI subset fails
-            if verbose:
-                logging.info("Falling back to full image segmentation (this uses more memory)...")
-                if "memory" in str(roi_error).lower() or "out of memory" in str(roi_error).lower():
-                    logging.warning("Memory error detected. Consider using --fast flag for lower memory usage.")
-            
-            # Clear output directory before retry
-            if output_dir.exists():
-                shutil.rmtree(output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Use fast mode on fallback to reduce memory usage (unless already specified)
-            use_fast = True  # Force fast mode on fallback for memory efficiency
-            
-            totalsegmentator(
-                input=str(nifti_path),
-                output=str(output_dir),
-                fast=use_fast,
-                device=device,
-                verbose=verbose,
-                preview=enable_preview  # Enable preview on Linux/WSL, disable on Windows native
-            )
+                logging.info("Passing DICOM directory directly to TotalSegmentator (matches CLI behavior)")
+        else:
+            input_path = str(nifti_path)
+        
+        totalsegmentator(
+            input=input_path,
+            output=str(output_dir),
+            task="vertebrae_body",
+            fast=fast,
+            device=device,
+            verbose=verbose,
+            preview=enable_preview  # Enable preview on Linux/WSL, disable on Windows native
+        )
         
         # Clean up any non-vertebrae files that might exist
         _cleanup_non_vertebrae_files(output_dir, verbose)
@@ -136,8 +116,14 @@ def _cleanup_non_vertebrae_files(output_dir: Path, verbose: bool = True) -> None
     
     removed_count = 0
     for file_path in output_dir.glob("*.nii*"):
-        # Check if file is a lumbar vertebra (handle both .nii.gz and .nii extensions)
+        # Check if file is a lumbar vertebra or vertebrae_body (handle both .nii.gz and .nii extensions)
         is_vertebra = False
+        
+        # Keep vertebrae_body.nii.gz (from vertebrae_body task)
+        if file_path.name.startswith('vertebrae_body') and file_path.name.endswith(('.nii.gz', '.nii')):
+            is_vertebra = True
+        
+        # Keep individual lumbar vertebrae (L1-L5)
         for vertebra in LUMBAR_VERTEBRAE:
             if file_path.name.startswith(vertebra) and file_path.name.endswith(('.nii.gz', '.nii')):
                 is_vertebra = True
