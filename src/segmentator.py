@@ -4,13 +4,13 @@ Segmentation Module
 Interfaces with TotalSegmentator Python API to segment lumbar vertebrae.
 """
 
+import logging
+import platform
 from pathlib import Path
 from typing import List, Optional
-import logging
-import numpy as np
+
 import nibabel as nib
-import shutil
-import platform
+import numpy as np
 
 try:
     from totalsegmentator.python_api import totalsegmentator

@@ -7,11 +7,12 @@ from segmentation masks.
 
 import json
 import logging
-import numpy as np
-import nibabel as nib
-from scipy import ndimage
 from pathlib import Path
 from typing import Dict, Optional
+
+import nibabel as nib
+import numpy as np
+from scipy import ndimage
 
 # Lumbar vertebrae labels
 LUMBAR_VERTEBRAE = [

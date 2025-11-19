@@ -4,13 +4,13 @@ Visualization Module
 Generates preview images showing segmented vertebrae overlaid on original CT images.
 """
 
-import numpy as np
-import nibabel as nib
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
-from pathlib import Path
-from typing import List, Optional, Dict
 import logging
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import matplotlib.pyplot as plt
+import nibabel as nib
+import numpy as np
 
 # Lumbar vertebrae labels
 LUMBAR_VERTEBRAE = [

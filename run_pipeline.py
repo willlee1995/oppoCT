@@ -7,9 +7,9 @@ Usage:
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
-import logging
 
 from src.pipeline import process_batch
 

@@ -4,11 +4,13 @@ DICOM Processing Module
 Converts DICOM series to NIfTI format and extracts patient identifiers.
 """
 
-import numpy as np
 from pathlib import Path
-from typing import Tuple, Optional
-import pydicom
+from typing import Optional, Tuple
+
 import nibabel as nib
+import numpy as np
+import pydicom
+
 from .patient_manager import get_patient_metadata, normalize_patient_id
 
 

@@ -1,6 +1,0 @@
-patient_id,vertebra,volume,intensity
-ANNOY,vertebrae_L1,0.0,0.0
-ANNOY,vertebrae_L2,0.0,0.0
-ANNOY,vertebrae_L3,0.0,0.0
-ANNOY,vertebrae_L4,0.0,0.0
-ANNOY,vertebrae_L5,0.0,0.0

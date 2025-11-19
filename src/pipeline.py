@@ -6,17 +6,17 @@ DICOM -> NIfTI -> Segmentation -> Statistics -> Visualization -> CSV Export
 """
 
 import logging
+import shutil
 import tempfile
 from pathlib import Path
-from typing import List, Dict, Optional
-import shutil
+from typing import Dict, List, Optional
 
+from .csv_exporter import export_batch_to_csv, export_patient_to_csv
 from .dicom_processor import dicom_to_nifti, extract_patient_id
-from .patient_manager import create_patient_output_dir, get_patient_metadata
+from .patient_manager import create_patient_output_dir
 from .segmentator import segment_lumbar_vertebrae, verify_segmentation_output
 from .statistics import calculate_patient_statistics, save_statistics_json
 from .visualizer import create_patient_preview
-from .csv_exporter import export_patient_to_csv, export_batch_to_csv
 
 # Configure logging
 logging.basicConfig(
@@ -85,7 +85,7 @@ def process_single_patient(
         
         # Step 4: Segment lumbar vertebrae
         # Pass DICOM directory directly to TotalSegmentator to match CLI behavior
-        logging.info(f"Segmenting lumbar vertebrae...")
+        logging.info("Segmenting lumbar vertebrae...")
         segment_lumbar_vertebrae(
             nifti_path=temp_nifti_path,
             output_dir=segmentations_dir,
@@ -257,7 +257,7 @@ def process_batch(
     failed = len(all_results) - successful
     
     logging.info(f"\n{'='*60}")
-    logging.info(f"Batch processing complete!")
+    logging.info("Batch processing complete!")
     logging.info(f"Successfully processed: {successful}/{len(all_results)}")
     logging.info(f"Failed: {failed}/{len(all_results)}")
     logging.info(f"{'='*60}")

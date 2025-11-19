@@ -5,9 +5,10 @@ Converts statistics JSON to CSV format for easy analysis and DEXA matching.
 """
 
 import json
-import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Optional
+
+import pandas as pd
 
 # Lumbar vertebrae labels
 LUMBAR_VERTEBRAE = [

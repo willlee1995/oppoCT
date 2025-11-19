@@ -9,19 +9,20 @@ Usage:
 """
 
 import argparse
-import numpy as np
-import nibabel as nib
-from nibabel.processing import resample_from_to
-from pathlib import Path
-import pydicom
 import logging
 import sys
+from pathlib import Path
+
+import nibabel as nib
+import numpy as np
+from nibabel.processing import resample_from_to
 
 # Setup logging first
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 import matplotlib
+
 # Force interactive backend - must be set before importing pyplot
 # Try multiple backends in order of preference
 backends_to_try = ['TkAgg', 'Qt5Agg', 'Qt4Agg']
@@ -33,7 +34,7 @@ for backend_name in backends_to_try:
         backend_set = True
         logger.info(f"Using matplotlib backend: {backend_name}")
         break
-    except (ImportError, ValueError) as e:
+    except (ImportError, ValueError):
         continue
 
 if not backend_set:
@@ -46,15 +47,16 @@ if not backend_set:
     else:
         logger.info(f"Using default matplotlib backend: {current_backend}")
 
-import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider, Button
-from matplotlib.patches import Rectangle
-import pandas as pd
 from typing import Dict, List, Optional, Tuple
 
-from src.pipeline import find_patient_folders, process_single_patient
+import matplotlib.pyplot as plt
+import pandas as pd
+from matplotlib.patches import Rectangle
+from matplotlib.widgets import Button, Slider
+
 from src.patient_manager import get_patient_metadata
-from verify_segmentation import load_dicom_series, load_totalseg_ct, load_segmentation_mask
+from src.pipeline import find_patient_folders, process_single_patient
+from verify_segmentation import load_dicom_series, load_segmentation_mask
 
 # Color map for different vertebrae (matching verify_segmentation.py)
 VERTEBRAE_COLORS = {
@@ -621,7 +623,7 @@ class VerificationViewer:
         self.update_info_text()
         
         # Show plot (blocking) - wait for user to close window
-        logger.info(f"Displaying interactive window...")
+        logger.info("Displaying interactive window...")
         plt.show(block=True)
         
         # Ensure figure is closed
@@ -840,7 +842,7 @@ def run_verification_pipeline(
     
     output_base_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output directory: {output_base_dir}")
-    logger.info(f"Existing segmentations will be reused if found.")
+    logger.info("Existing segmentations will be reused if found.")
     
     # Create temporary directory for processing (only for intermediate files)
     temp_dir = Path(tempfile.mkdtemp(prefix='verification_temp_'))
@@ -921,7 +923,7 @@ def run_verification_pipeline(
     save_verification_results(all_results, output_csv)
     
     logger.info(f"\n{'='*60}")
-    logger.info(f"Verification pipeline complete!")
+    logger.info("Verification pipeline complete!")
     logger.info(f"Processed {len(patient_folders)} cases")
     logger.info(f"Results saved to {output_csv}")
     logger.info(f"{'='*60}")

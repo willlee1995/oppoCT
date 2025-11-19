@@ -5,6 +5,7 @@ Helper script to check PyTorch CUDA availability and provide installation instru
 
 import sys
 
+
 def check_pytorch_cuda():
     """Check if PyTorch can detect CUDA."""
     try:
@@ -46,6 +47,7 @@ def check_pytorch_cuda():
 if __name__ == '__main__':
     success = check_pytorch_cuda()
     sys.exit(0 if success else 1)
+
 
 
 

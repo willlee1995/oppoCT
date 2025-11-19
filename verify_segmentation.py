@@ -10,21 +10,22 @@ Usage:
 """
 
 import argparse
-import numpy as np
+import logging
+from pathlib import Path
+from typing import Dict
+
+import matplotlib.pyplot as plt
 import nibabel as nib
+import numpy as np
+import pydicom
+from matplotlib.widgets import Slider
 from nibabel.orientations import (
-    axcodes2ornt,
     apply_orientation,
+    axcodes2ornt,
     inv_ornt_aff,
     ornt_transform,
 )
 from nibabel.processing import resample_from_to
-import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
-from pathlib import Path
-import pydicom
-from typing import Dict, List, Optional
-import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -680,7 +681,7 @@ def main():
     
     if args.mode in ['static', 'both']:
         output_path = args.output / f"verification_{args.vertebra}.png"
-        logger.info(f"Creating static verification image...")
+        logger.info("Creating static verification image...")
         create_static_verification(
             ct_volume,
             masks,
