@@ -56,18 +56,29 @@ from matplotlib.widgets import Button, Slider
 
 from src.patient_manager import get_patient_metadata
 from src.pipeline import find_patient_folders, process_single_patient
+from src.visualizer import find_representative_slices
 from verify_segmentation import load_dicom_series, load_segmentation_mask
 
 # Color map for different vertebrae (matching verify_segmentation.py)
 VERTEBRAE_COLORS = {
+    'vertebrae_T11': '#800080',  # Purple
+    'vertebrae_T12': '#FFC0CB',  # Pink
     'vertebrae_L1': '#FF0000',  # Red
     'vertebrae_L2': '#FF8C00',  # Dark Orange
     'vertebrae_L3': '#FFD700',  # Gold
     'vertebrae_L4': '#00FF00',  # Lime
     'vertebrae_L5': '#0000FF',  # Blue
+    'vertebrae_T11_body': '#4B0082',  # Indigo
+    'vertebrae_T12_body': '#DB7093',  # Pale Violet Red
+    'vertebrae_L1_body': '#800000',  # Dark Red
+    'vertebrae_L2_body': '#8B4500',  # Saddle Brown
+    'vertebrae_L3_body': '#B8860B',  # Dark Goldenrod
+    'vertebrae_L4_body': '#006400',  # Dark Green
+    'vertebrae_L5_body': '#00008B',  # Dark Blue
 }
 
-LUMBAR_VERTEBRAE = ['vertebrae_L1', 'vertebrae_L2', 'vertebrae_L3', 'vertebrae_L4', 'vertebrae_L5']
+LUMBAR_VERTEBRAE = ['vertebrae_T11', 'vertebrae_T12', 'vertebrae_L1', 'vertebrae_L2', 'vertebrae_L3', 'vertebrae_L4', 'vertebrae_L5']
+LUMBAR_BODIES = [f"{v}_body" for v in LUMBAR_VERTEBRAE]
 
 
 class VerificationViewer:
@@ -113,7 +124,13 @@ class VerificationViewer:
         self.sagittal_slice = ct_volume.shape[1] // 2  # Width axis (for sagittal view)
         
         # Selected slices for HU calculation
-        self.selected_slices: List[int] = []
+        # Auto-select representative slices by default
+        try:
+            self.selected_slices = find_representative_slices(ct_volume, masks, num_slices=3)
+            logger.info(f"Auto-selected slices: {self.selected_slices}")
+        except Exception as e:
+            logger.warning(f"Failed to auto-select slices: {e}")
+            self.selected_slices: List[int] = []
         
         # Case status
         self.is_successful: Optional[bool] = None
@@ -127,10 +144,26 @@ class VerificationViewer:
         self.btn_success = None
         self.btn_fail = None
         self.btn_select_slice = None
+        self.btn_auto_select = None
         self.btn_done = None
         
         # Display state
         self.show_selected = True
+        
+        # Label mapping: Target Label -> Source Mask Name
+        # Default: L1 -> vertebrae_L1_body, etc.
+        self.label_mapping = {v.replace('vertebrae_', '').replace('_body', ''): v for v in LUMBAR_BODIES}
+        # Ensure we have mappings for all bodies in LUMBAR_BODIES
+        for v in LUMBAR_BODIES:
+            short_name = v.replace('vertebrae_', '').replace('_body', '')
+            if short_name not in self.label_mapping:
+                self.label_mapping[short_name] = v
+
+        # UI elements for label correction
+        self.btn_shift_up = None
+        self.btn_shift_down = None
+        self.btn_reset = None
+        self.txt_mapping = None
         
     def calculate_sagittal_view(self, slice_idx: int) -> np.ndarray:
         """
@@ -159,12 +192,45 @@ class VerificationViewer:
         sagittal_slice = self.ct_volume[:, slice_idx, :]
         return sagittal_slice
     
-    def calculate_average_hu(self, slice_indices: List[int]) -> float:
+    def calculate_volumetric_hu(self, vertebra_name: str) -> float:
         """
-        Calculate average HU value for selected slices within masked regions only.
+        Calculate average HU value for the entire volume of a specific vertebra.
+        
+        Args:
+            vertebra_name: Target label (e.g., 'L1')
+            
+        Returns:
+            Average HU value within the entire mask
+        """
+        # Get the source mask name from mapping
+        mask_name = self.label_mapping.get(vertebra_name)
+        if not mask_name or mask_name not in self.masks:
+            return 0.0
+            
+        mask = self.masks[mask_name]
+        
+        # Ensure mask matches CT shape
+        if mask.shape != self.ct_volume.shape:
+            logger.warning(f"Shape mismatch for {mask_name}: {mask.shape} vs {self.ct_volume.shape}")
+            return 0.0
+            
+        # Get HU values where mask is present
+        # Note: CT and mask should already be aligned/resampled
+        masked_hu_values = self.ct_volume[mask > 0]
+        
+        if masked_hu_values.size == 0:
+            return 0.0
+            
+        return float(np.mean(masked_hu_values))
+
+    def calculate_average_hu(self, slice_indices: List[int], vertebra_name: Optional[str] = None) -> float:
+        """
+        Calculate average HU value for selected slices.
         
         Args:
             slice_indices: List of slice indices (axial slices)
+            vertebra_name: If provided, only calculate for this specific vertebra mask.
+                          If None, calculates for all combined masks (legacy behavior).
             
         Returns:
             Average HU value within mask regions
@@ -179,9 +245,20 @@ class VerificationViewer:
                 ct_slice = self.ct_volume[:, :, slice_idx]
                 ct_slice = np.fliplr(ct_slice)  # Flip horizontally (same as display)
                 
-                # Combine all masks to get total masked region
+                # Determine which mask(s) to use
+                if vertebra_name:
+                    # Specific vertebra
+                    mask_name = self.label_mapping.get(vertebra_name)
+                    if not mask_name or mask_name not in self.masks:
+                        continue
+                    masks_to_use = [self.masks[mask_name]]
+                else:
+                    # All masks (legacy)
+                    masks_to_use = self.masks.values()
+
+                # Combine masks
                 combined_mask = np.zeros_like(ct_slice, dtype=bool)
-                for mask in self.masks.values():
+                for mask in masks_to_use:
                     if len(mask.shape) == 3 and slice_idx < mask.shape[2]:
                         mask_slice = mask[:, :, slice_idx]
                         # Apply same transformations as in display
@@ -438,6 +515,17 @@ class VerificationViewer:
         self.update_axial(self.axial_slice)
         self.update_sagittal(self.sagittal_slice)
         self.update_info_text()
+
+    def auto_select_slices(self, event):
+        """Auto-select representative slices."""
+        try:
+            self.selected_slices = find_representative_slices(self.ct_volume, self.masks, num_slices=3)
+            logger.info(f"Auto-selected slices: {self.selected_slices}")
+            self.update_axial(self.axial_slice)
+            self.update_sagittal(self.sagittal_slice)
+            self.update_info_text()
+        except Exception as e:
+            logger.error(f"Error auto-selecting slices: {e}")
     
     def mark_success(self, event):
         """Mark case as successful."""
@@ -448,6 +536,75 @@ class VerificationViewer:
         """Mark case as failed."""
         self.is_successful = False
         self.update_info_text()
+
+    def shift_labels_up(self, event):
+        """
+        Shift labels UP (cranial).
+        Target L1 takes Source L2.
+        Target L2 takes Source L3.
+        ...
+        """
+        # Order of vertebrae: T11, T12, L1, L2, L3, L4, L5
+        ordered_labels = ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']
+        
+        new_mapping = {}
+        for i, target in enumerate(ordered_labels):
+            if i + 1 < len(ordered_labels):
+                source_label = ordered_labels[i+1]
+                # Find the mask currently mapped to source_label (or default)
+                # Actually, we want to shift the SOURCE masks.
+                # If L1 was using L1_body, and we shift up, L1 should use L2_body.
+                
+                # Let's look at the DEFAULT mapping for the next vertebra
+                next_default_mask = f"vertebrae_{ordered_labels[i+1]}_body"
+                new_mapping[target] = next_default_mask
+            else:
+                # Last one (L5) has no source below it
+                new_mapping[target] = None 
+        
+        self.label_mapping.update(new_mapping)
+        self.update_info_text()
+        self.update_mapping_text()
+
+    def shift_labels_down(self, event):
+        """
+        Shift labels DOWN (caudal).
+        Target L2 takes Source L1.
+        Target L3 takes Source L2.
+        ...
+        """
+        ordered_labels = ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']
+        
+        new_mapping = {}
+        for i, target in enumerate(ordered_labels):
+            if i - 1 >= 0:
+                prev_default_mask = f"vertebrae_{ordered_labels[i-1]}_body"
+                new_mapping[target] = prev_default_mask
+            else:
+                # First one (T11) has no source above it
+                new_mapping[target] = None
+        
+        self.label_mapping.update(new_mapping)
+        self.update_info_text()
+        self.update_mapping_text()
+
+    def reset_labels(self, event):
+        """Reset labels to default."""
+        self.label_mapping = {v.replace('vertebrae_', '').replace('_body', ''): v for v in LUMBAR_BODIES}
+        self.update_info_text()
+        self.update_mapping_text()
+
+    def update_mapping_text(self):
+        """Update the display of current label mapping."""
+        if hasattr(self, 'txt_mapping'):
+            text = "Label Mapping:\n"
+            ordered_labels = ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']
+            for label in ordered_labels:
+                source = self.label_mapping.get(label)
+                source_name = source.replace('vertebrae_', '').replace('_body', '') if source else "NONE"
+                text += f"{label} <- {source_name}\n"
+            self.txt_mapping.set_text(text)
+            self.fig.canvas.draw_idle()
     
     def update_info_text(self):
         """Update information text display."""
@@ -579,11 +736,32 @@ class VerificationViewer:
         self.btn_select_slice.label.set_fontsize(11)
         self.btn_select_slice.label.set_weight('bold')
         self.btn_select_slice.on_clicked(self.toggle_slice_selection)
+
+        self.btn_auto_select = Button(plt.axes([0.49, btn_y, btn_width, btn_height]), 'Auto Select')
+        self.btn_auto_select.label.set_fontsize(11)
+        self.btn_auto_select.label.set_weight('bold')
+        self.btn_auto_select.on_clicked(self.auto_select_slices)
         
-        self.btn_done = Button(plt.axes([0.49, btn_y, btn_width * 1.5, btn_height]), 'Done (Save & Next)')
+        self.btn_done = Button(plt.axes([0.62, btn_y, btn_width * 1.2, btn_height]), 'Done (Save & Next)')
         self.btn_done.label.set_fontsize(11)
         self.btn_done.label.set_weight('bold')
         self.btn_done.on_clicked(lambda x: plt.close(self.fig))
+        
+        # Label Correction Controls
+        ax_controls_labels = plt.axes([0.75, 0.25, 0.15, 0.2])
+        ax_controls_labels.axis('off')
+        
+        self.txt_mapping = ax_controls_labels.text(0, 1, "", fontsize=10, verticalalignment='top', family='monospace')
+        self.update_mapping_text()
+        
+        self.btn_shift_up = Button(plt.axes([0.75, 0.20, 0.15, 0.04]), 'Shift Up (L1<-L2)')
+        self.btn_shift_up.on_clicked(self.shift_labels_up)
+        
+        self.btn_shift_down = Button(plt.axes([0.75, 0.15, 0.15, 0.04]), 'Shift Down (L2<-L1)')
+        self.btn_shift_down.on_clicked(self.shift_labels_down)
+        
+        self.btn_reset = Button(plt.axes([0.75, 0.10, 0.15, 0.04]), 'Reset Labels')
+        self.btn_reset.on_clicked(self.reset_labels)
         
         # Instructions
         instructions = (
@@ -631,12 +809,18 @@ class VerificationViewer:
             plt.close(self.fig)
         
         # Return results
+        # Return results
         return {
             'patient_id': self.patient_id,
             'exam_date': self.exam_date,
             'is_successful': self.is_successful,
             'selected_slices': self.selected_slices.copy(),
-            'average_hu': self.calculate_average_hu(self.selected_slices) if self.selected_slices else None
+            'average_hu': self.calculate_average_hu(self.selected_slices), # Overall average of selected slices
+            'label_mapping': self.label_mapping.copy(),
+            'vertebra_hu': {
+                label: self.calculate_volumetric_hu(label) # Volumetric average (all pixels)
+                for label in ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']
+            }
         }
 
 
@@ -658,10 +842,15 @@ def check_segmentations_exist(segmentation_dir: Path) -> bool:
     if vertebrae_body_path.exists():
         return True
     
-    # Check for individual vertebrae masks (L1-L5)
+    # Check for individual vertebrae masks (L1-L5) and bodies
     for vertebra in LUMBAR_VERTEBRAE:
         mask_path = segmentation_dir / f"{vertebra}.nii.gz"
         if mask_path.exists():
+            return True
+        
+        # Check for body mask
+        body_path = segmentation_dir / f"{vertebra}_body.nii.gz"
+        if body_path.exists():
             return True
     
     return False
@@ -737,8 +926,10 @@ def load_masks_for_verification(segmentation_dir: Path, ct_img: nib.Nifti1Image)
     masks = {}
     ct_shape = ct_img.shape[:3]  # Get spatial dimensions only
     
-    # First, try to load individual vertebrae masks (L1-L5)
-    for vertebra in LUMBAR_VERTEBRAE:
+    # First, try to load individual vertebrae masks (L1-L5) and bodies
+    # User requested to see only bodies, so we prioritize those and skip full vertebrae if bodies exist
+    # Actually, let's just load bodies as requested
+    for vertebra in LUMBAR_BODIES:
         mask_path = segmentation_dir / f"{vertebra}.nii.gz"
         if mask_path.exists():
             try:
@@ -955,7 +1146,10 @@ def save_verification_results(results: List[Dict], output_csv: Path):
             'Patient ID': patient_id,
             'Status': 'Success' if is_successful else ('Failed' if is_successful is False else 'Not Marked'),
             'Selected Slice Numbers': slice_numbers,
-            'Average HU': f"{average_hu:.2f}" if average_hu is not None else ''
+            'Average HU (All)': f"{average_hu:.2f}" if average_hu is not None else '',
+            # Add per-vertebra columns
+            **{f"{v} HU": f"{result.get('vertebra_hu', {}).get(v, 0.0):.2f}" for v in ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']},
+            **{f"{v} Source": result.get('label_mapping', {}).get(v, '') for v in ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']}
         })
     
     # Create DataFrame and save

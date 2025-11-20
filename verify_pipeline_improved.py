@@ -42,14 +42,24 @@ from verify_segmentation import load_segmentation_mask
 # --- Configuration ---
 
 VERTEBRAE_COLORS = {
+    'vertebrae_T11': '#800080',  # Purple
+    'vertebrae_T12': '#FFC0CB',  # Pink
     'vertebrae_L1': '#FF0000',  # Red
     'vertebrae_L2': '#FF8C00',  # Dark Orange
     'vertebrae_L3': '#FFD700',  # Gold
     'vertebrae_L4': '#00FF00',  # Lime
     'vertebrae_L5': '#0000FF',  # Blue
+    'vertebrae_T11_body': '#4B0082',  # Indigo
+    'vertebrae_T12_body': '#DB7093',  # Pale Violet Red
+    'vertebrae_L1_body': '#800000',  # Dark Red
+    'vertebrae_L2_body': '#8B4500',  # Saddle Brown
+    'vertebrae_L3_body': '#B8860B',  # Dark Goldenrod
+    'vertebrae_L4_body': '#006400',  # Dark Green
+    'vertebrae_L5_body': '#00008B',  # Dark Blue
 }
 
-LUMBAR_VERTEBRAE = ['vertebrae_L1', 'vertebrae_L2', 'vertebrae_L3', 'vertebrae_L4', 'vertebrae_L5']
+LUMBAR_VERTEBRAE = ['vertebrae_T11', 'vertebrae_T12', 'vertebrae_L1', 'vertebrae_L2', 'vertebrae_L3', 'vertebrae_L4', 'vertebrae_L5']
+LUMBAR_BODIES = [f"{v}_body" for v in LUMBAR_VERTEBRAE]
 
 # --- Helper Functions ---
 
@@ -148,7 +158,7 @@ def load_and_align_data(dicom_folder: Path, segmentation_dir: Path) -> Tuple[np.
         except Exception as e:
             logger.warning(f"Failed to load {name}: {e}")
 
-    for v in LUMBAR_VERTEBRAE:
+    for v in LUMBAR_BODIES:
         process_mask(segmentation_dir / f"{v}.nii.gz", v)
         
     if not masks:
@@ -406,7 +416,7 @@ def run_pipeline(input_dir: Path, output_csv: Path, output_base_dir: Path, fast:
             p_out = create_patient_output_dir(output_base_dir, pid)
             seg_dir = p_out / 'segmentations'
             
-            if not (seg_dir / 'vertebrae_L1.nii.gz').exists() and not (seg_dir / 'vertebrae_body.nii.gz').exists():
+            if not (seg_dir / 'vertebrae_L1.nii.gz').exists() and not (seg_dir / 'vertebrae_body.nii.gz').exists() and not (seg_dir / 'vertebrae_L1_body.nii.gz').exists():
                 process_single_patient(folder, output_base_dir, fast_segmentation=fast, device=device)
             
             ct, masks, _ = load_and_align_data(folder, seg_dir)

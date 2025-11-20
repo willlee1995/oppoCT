@@ -1,0 +1,23 @@
+{
+    "patient_id": "ANNOY",
+    "vertebrae_L1": {
+        "volume": 41988.8654999733,
+        "intensity": 77.92682525310725
+    },
+    "vertebrae_L2": {
+        "volume": 45825.20105886459,
+        "intensity": 88.3663172184931
+    },
+    "vertebrae_L3": {
+        "volume": 53701.78550815582,
+        "intensity": 153.55435062427597
+    },
+    "vertebrae_L4": {
+        "volume": 52236.37444782257,
+        "intensity": 142.45828371046713
+    },
+    "vertebrae_L5": {
+        "volume": 21041.090885162354,
+        "intensity": 116.53046977660972
+    }
+}

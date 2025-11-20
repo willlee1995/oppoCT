@@ -11,9 +11,30 @@ from typing import Dict, List, Optional
 import matplotlib.pyplot as plt
 import nibabel as nib
 import numpy as np
+from nibabel.processing import resample_from_to
 
-# Lumbar vertebrae labels
+# Define vertebrae and their colors for visualization
+VERTEBRAE_COLORS = {
+    'vertebrae_T11': 'purple',
+    'vertebrae_T12': 'pink',
+    'vertebrae_L1': 'red',
+    'vertebrae_L2': 'orange',
+    'vertebrae_L3': 'yellow',
+    'vertebrae_L4': 'green',
+    'vertebrae_L5': 'blue',
+    'vertebrae_T11_body': 'purple',
+    'vertebrae_T12_body': 'pink',
+    'vertebrae_L1_body': 'red',
+    'vertebrae_L2_body': 'orange',
+    'vertebrae_L3_body': 'yellow',
+    'vertebrae_L4_body': 'green',
+    'vertebrae_L5_body': 'blue'
+}
+
+# Define the list of vertebrae to process
 LUMBAR_VERTEBRAE = [
+    'vertebrae_T11',
+    'vertebrae_T12',
     'vertebrae_L1',
     'vertebrae_L2',
     'vertebrae_L3',
@@ -21,114 +42,99 @@ LUMBAR_VERTEBRAE = [
     'vertebrae_L5'
 ]
 
-# Color map for different vertebrae
-VERTEBRAE_COLORS = {
-    'vertebrae_L1': 'red',
-    'vertebrae_L2': 'orange',
-    'vertebrae_L3': 'yellow',
-    'vertebrae_L4': 'green',
-    'vertebrae_L5': 'blue'
-}
-
-
-def find_representative_slices(
-    ct_image: np.ndarray,
-    segmentation_masks: Dict[str, np.ndarray],
-    num_slices: int = 3
-) -> List[int]:
+def find_representative_slices(ct_volume: np.ndarray, masks: Dict[str, np.ndarray], num_slices: int = 3) -> List[int]:
     """
-    Find representative slices that contain the most vertebra content.
+    Find representative slices that contain the most vertebral content.
     
     Args:
-        ct_image: 3D CT image array
-        segmentation_masks: Dictionary of vertebra_name -> mask array
+        ct_volume: 3D CT volume
+        masks: Dictionary of vertebra_name -> mask array
         num_slices: Number of slices to return
         
     Returns:
         List of slice indices
     """
-    # Sum all masks to find slices with most content
-    combined_mask = np.zeros_like(ct_image, dtype=bool)
-    for mask in segmentation_masks.values():
-        combined_mask |= (mask > 0)
+    # Count non-zero pixels per slice across all masks
+    slice_counts = np.zeros(ct_volume.shape[2])
     
-    # Sum along z-axis to find slices with most content
-    slice_sums = np.sum(combined_mask, axis=(0, 1))
+    for mask in masks.values():
+        # Ensure mask matches CT depth
+        if len(mask.shape) == 3 and mask.shape[2] == ct_volume.shape[2]:
+            # Sum non-zero pixels for each slice
+            # axis=(0, 1) sums over height and width, leaving depth
+            slice_counts += np.sum(mask > 0, axis=(0, 1))
+            
+    # Find slices with maximum content
+    # Get indices of slices sorted by count (descending)
+    sorted_indices = np.argsort(slice_counts)[::-1]
     
-    # Get indices of slices with most content
-    if np.sum(slice_sums) == 0:
-        # No segmentation found, return middle slices
-        return [ct_image.shape[2] // 2]
+    # Filter out slices with zero content
+    valid_indices = [idx for idx in sorted_indices if slice_counts[idx] > 0]
     
-    top_indices = np.argsort(slice_sums)[-num_slices:]
-    return sorted(top_indices.tolist())
-
+    if not valid_indices:
+        return []
+    
+    # Select top N slices, but try to space them out if possible
+    # For now, just take the top N unique slices
+    selected_slices = sorted(valid_indices[:num_slices])
+    
+    return [int(s) for s in selected_slices]
 
 def create_preview(
     ct_image: np.ndarray,
     segmentation_masks: Dict[str, np.ndarray],
     output_path: Path,
-    slice_indices: Optional[List[int]] = None,
     window_level: int = 40,
     window_width: int = 400
 ) -> None:
     """
-    Create preview image showing segmented vertebrae overlaid on CT.
-    
-    Args:
-        ct_image: 3D CT image array
-        segmentation_masks: Dictionary of vertebra_name -> mask array
-        output_path: Path to save preview image
-        slice_indices: List of slice indices to display. If None, finds representative slices.
-        window_level: Window level for CT display
-        window_width: Window width for CT display
+    Generate a preview image with segmentation overlays.
     """
-    # Find representative slices if not provided
-    if slice_indices is None:
-        slice_indices = find_representative_slices(ct_image, segmentation_masks, num_slices=3)
+    # Find the slice with the most segmentation content
+    best_slice = 0
+    max_content = 0
     
-    num_slices = len(slice_indices)
-    fig, axes = plt.subplots(1, num_slices, figsize=(5 * num_slices, 5))
-    
-    if num_slices == 1:
-        axes = [axes]
-    
-    for idx, slice_idx in enumerate(slice_indices):
-        ax = axes[idx]
-        
-        # Extract slice
-        ct_slice = ct_image[:, :, slice_idx]
-        
-        # Apply windowing
-        ct_min = window_level - window_width / 2
-        ct_max = window_level + window_width / 2
-        ct_slice_display = np.clip(ct_slice, ct_min, ct_max)
-        ct_slice_display = (ct_slice_display - ct_min) / (ct_max - ct_min)
-        
-        # Display CT slice
-        ax.imshow(ct_slice_display, cmap='gray', origin='lower')
-        
-        # Overlay segmentation masks
-        for vertebra_name, mask in segmentation_masks.items():
-            if mask.shape != ct_image.shape:
-                # Resize mask if needed
-                min_shape = tuple(min(m, c) for m, c in zip(mask.shape, ct_image.shape))
-                mask_slice = mask[:min_shape[0], :min_shape[1], slice_idx] if slice_idx < min_shape[2] else np.zeros((min_shape[0], min_shape[1]))
-            else:
-                mask_slice = mask[:, :, slice_idx]
+    # Combine all masks to find best slice
+    combined_mask = np.zeros_like(ct_image, dtype=bool)
+    for mask in segmentation_masks.values():
+        if mask.shape == ct_image.shape:
+            combined_mask = combined_mask | (mask > 0)
             
-            if np.any(mask_slice > 0):
-                color = VERTEBRAE_COLORS.get(vertebra_name, 'cyan')
-                ax.contour(mask_slice, levels=[0.5], colors=color, linewidths=2, alpha=0.8)
-        
-        ax.set_title(f'Slice {slice_idx}')
-        ax.axis('off')
+    # Sum content per slice
+    slice_content = np.sum(combined_mask, axis=(0, 1))
+    best_slice = np.argmax(slice_content)
     
-    plt.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    if slice_content[best_slice] == 0:
+        # No segmentation found, use middle slice
+        best_slice = ct_image.shape[2] // 2
+        
+    # Extract slice
+    ct_slice = ct_image[:, :, best_slice]
+    
+    # Windowing
+    ct_min = window_level - window_width / 2
+    ct_max = window_level + window_width / 2
+    ct_display = np.clip(ct_slice, ct_min, ct_max)
+    ct_display = (ct_display - ct_min) / (ct_max - ct_min)
+    
+    # Create plot
+    plt.figure(figsize=(10, 10))
+    plt.imshow(ct_display, cmap='gray', origin='lower')
+    
+    # Overlay masks
+    for name, mask in segmentation_masks.items():
+        if mask.shape == ct_image.shape:
+            mask_slice = mask[:, :, best_slice]
+            if np.any(mask_slice):
+                color = VERTEBRAE_COLORS.get(name, 'red')
+                plt.contour(mask_slice, levels=[0.5], colors=[color], linewidths=2)
+                
+    plt.title(f"Preview - Slice {best_slice}")
+    plt.axis('off')
+    
+    # Save
+    plt.savefig(output_path, bbox_inches='tight')
     plt.close()
-
 
 def create_patient_preview(
     patient_id: str,
@@ -161,17 +167,25 @@ def create_patient_preview(
     for vertebra in LUMBAR_VERTEBRAE:
         mask_path = segmentation_dir / f"{vertebra}.nii.gz"
         if mask_path.exists():
-            mask_nifti = nib.load(str(mask_path))
-            mask = mask_nifti.get_fdata()
-            
-            # Ensure mask matches CT shape
-            if mask.shape == ct_image.shape:
+            try:
+                mask_nifti = nib.load(str(mask_path))
+                
+                # Check if resampling is needed
+                # Check shape and affine (with some tolerance for affine)
+                shape_match = mask_nifti.shape == ct_nifti.shape
+                affine_match = np.allclose(mask_nifti.affine, ct_nifti.affine, atol=1e-3)
+                
+                if shape_match and affine_match:
+                    mask = mask_nifti.get_fdata()
+                else:
+                    logging.info(f"Resampling {vertebra} mask to match CT space...")
+                    resampled_nifti = resample_from_to(mask_nifti, ct_nifti, order=0)
+                    mask = resampled_nifti.get_fdata()
+                
                 segmentation_masks[vertebra] = mask
-            else:
-                # Masks are in TotalSegmentator's resampled space
-                # For visualization, we'll use masks as-is and handle shape mismatch in display
-                logging.info(f"Mask shape {mask.shape} doesn't match CT shape {ct_image.shape} for {vertebra} - using mask as-is")
-                segmentation_masks[vertebra] = mask
+                
+            except Exception as e:
+                logging.warning(f"Failed to load/resample mask {mask_path}: {e}")
     
     # Create preview
     output_path = output_dir / f"{patient_id}_preview.png"
@@ -184,6 +198,3 @@ def create_patient_preview(
     )
     
     return output_path
-
-
-

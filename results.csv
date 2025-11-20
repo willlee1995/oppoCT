@@ -1,2 +1,2 @@
-Exam Date,Patient ID,Status,Selected Slice Numbers,Average HU
-20210323,Annoy,Not Marked,,
+Exam Date,Patient ID,Status,Selected Slice Numbers,Average HU (All),T11 HU,T12 HU,L1 HU,L2 HU,L3 HU,L4 HU,L5 HU,T11 Source,T12 Source,L1 Source,L2 Source,L3 Source,L4 Source,L5 Source
+20210323,Annoy,Success,"7,8,11",302.40,-891.22,-719.62,77.23,119.70,207.72,277.38,301.27,vertebrae_T11_body,vertebrae_T12_body,vertebrae_L1_body,vertebrae_L2_body,vertebrae_L3_body,vertebrae_L4_body,vertebrae_L5_body

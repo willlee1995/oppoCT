@@ -21,6 +21,8 @@ except ImportError:
 
 # Lumbar vertebrae labels
 LUMBAR_VERTEBRAE = [
+    'vertebrae_T11',
+    'vertebrae_T12',
     'vertebrae_L1',
     'vertebrae_L2',
     'vertebrae_L3',
@@ -78,6 +80,7 @@ def segment_lumbar_vertebrae(
         else:
             input_path = str(nifti_path)
         
+        # 1. Run vertebrae_body task to get the body masks (unlabeled levels)
         totalsegmentator(
             input=input_path,
             output=str(output_dir),
@@ -85,8 +88,70 @@ def segment_lumbar_vertebrae(
             fast=fast,
             device=device,
             verbose=verbose,
-            preview=enable_preview  # Enable preview on Linux/WSL, disable on Windows native
+            preview=enable_preview
         )
+
+        # 2. Run total task with ROI subset to get labeled whole vertebrae (L1-L5)
+        if verbose:
+            logging.info("Segmenting labeled vertebrae (L1-L5) using TotalSegmentator...")
+        
+        totalsegmentator(
+            input=input_path,
+            output=str(output_dir),
+            task="total",
+            roi_subset=LUMBAR_VERTEBRAE,
+            fast=fast,
+            device=device,
+            verbose=verbose,
+            preview=enable_preview
+        )
+
+        # 3. Intersect masks to get labeled vertebral bodies
+        if verbose:
+            logging.info("Intersecting masks to generate labeled vertebral bodies...")
+
+        # Load vertebrae_body mask
+        # Note: vertebrae_body task output might be 'vertebrae_body.nii.gz' containing all bodies
+        body_mask_path = output_dir / "vertebrae_body.nii.gz"
+        if not body_mask_path.exists():
+             # Fallback: sometimes it might be named differently or split? 
+             # Usually vertebrae_body task produces one file with all bodies if it's a binary mask, 
+             # OR it produces 'vertebrae_body.nii.gz' which is a binary mask of all bodies.
+             # Let's assume it exists as per standard behavior.
+             logging.warning(f"vertebrae_body.nii.gz not found at {body_mask_path}")
+        
+        try:
+            body_img = nib.load(str(body_mask_path))
+            body_data = body_img.get_fdata() > 0
+            affine = body_img.affine
+            header = body_img.header
+
+            for vertebra in LUMBAR_VERTEBRAE:
+                vert_path = output_dir / f"{vertebra}.nii.gz"
+                if vert_path.exists():
+                    vert_img = nib.load(str(vert_path))
+                    vert_data = vert_img.get_fdata() > 0
+                    
+                    # Intersect
+                    intersect_data = np.logical_and(body_data, vert_data).astype(np.uint8)
+                    
+                    # Save intersection
+                    out_name = f"{vertebra}_body.nii.gz"
+                    out_path = output_dir / out_name
+                    
+                    new_img = nib.Nifti1Image(intersect_data, affine, header)
+                    nib.save(new_img, str(out_path))
+                    
+                    if verbose:
+                        logging.info(f"Generated {out_name}")
+                else:
+                    if verbose:
+                        logging.warning(f"Mask for {vertebra} not found, skipping intersection.")
+
+        except Exception as e:
+            logging.error(f"Error during intersection: {e}")
+            # Don't raise here, we still have partial results? 
+            # Or maybe we should raise. Let's log and continue cleanup.
         
         # Clean up any non-vertebrae files that might exist
         _cleanup_non_vertebrae_files(output_dir, verbose)
@@ -123,9 +188,14 @@ def _cleanup_non_vertebrae_files(output_dir: Path, verbose: bool = True) -> None
         if file_path.name.startswith('vertebrae_body') and file_path.name.endswith(('.nii.gz', '.nii')):
             is_vertebra = True
         
-        # Keep individual lumbar vertebrae (L1-L5)
+        # Keep individual lumbar vertebrae (L1-L5) and their body intersections
         for vertebra in LUMBAR_VERTEBRAE:
+            # Keep vertebrae_L*.nii.gz
             if file_path.name.startswith(vertebra) and file_path.name.endswith(('.nii.gz', '.nii')):
+                is_vertebra = True
+                break
+            # Keep vertebrae_L*_body.nii.gz
+            if file_path.name.startswith(f"{vertebra}_body") and file_path.name.endswith(('.nii.gz', '.nii')):
                 is_vertebra = True
                 break
         

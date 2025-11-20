@@ -33,14 +33,24 @@ logger = logging.getLogger(__name__)
 
 # Color map for different vertebrae
 VERTEBRAE_COLORS = {
+    'vertebrae_T11': '#800080',  # Purple
+    'vertebrae_T12': '#FFC0CB',  # Pink
     'vertebrae_L1': '#FF0000',  # Red
     'vertebrae_L2': '#FF8C00',  # Dark Orange
     'vertebrae_L3': '#FFD700',  # Gold
     'vertebrae_L4': '#00FF00',  # Lime
     'vertebrae_L5': '#0000FF',  # Blue
+    'vertebrae_T11_body': '#4B0082',  # Indigo
+    'vertebrae_T12_body': '#DB7093',  # Pale Violet Red
+    'vertebrae_L1_body': '#800000',  # Dark Red
+    'vertebrae_L2_body': '#8B4500',  # Saddle Brown
+    'vertebrae_L3_body': '#B8860B',  # Dark Goldenrod
+    'vertebrae_L4_body': '#006400',  # Dark Green
+    'vertebrae_L5_body': '#00008B',  # Dark Blue
 }
 
-LUMBAR_VERTEBRAE = ['vertebrae_L1', 'vertebrae_L2', 'vertebrae_L3', 'vertebrae_L4', 'vertebrae_L5']
+LUMBAR_VERTEBRAE = ['vertebrae_T11', 'vertebrae_T12', 'vertebrae_L1', 'vertebrae_L2', 'vertebrae_L3', 'vertebrae_L4', 'vertebrae_L5']
+LUMBAR_BODIES = [f"{v}_body" for v in LUMBAR_VERTEBRAE]
 
 
 def load_dicom_series(dicom_dir: Path) -> nib.Nifti1Image:
@@ -606,11 +616,17 @@ def main():
     
     # Determine which vertebrae to load
     if args.vertebra.lower() == 'all':
-        vertebrae_to_load = LUMBAR_VERTEBRAE
+        vertebrae_to_load = LUMBAR_BODIES
     else:
-        vertebra_name = f"vertebrae_{args.vertebra.upper()}"
-        if vertebra_name not in LUMBAR_VERTEBRAE:
-            logger.warning(f"{vertebra_name} is not a lumbar vertebra. Loading anyway...")
+        vertebra_name = f"vertebrae_{args.vertebra}"
+        # Handle if user already passed "vertebrae_L1" or just "L1"
+        if not args.vertebra.startswith('vertebrae_'):
+             vertebra_name = f"vertebrae_{args.vertebra}"
+        else:
+             vertebra_name = args.vertebra
+
+        if vertebra_name not in LUMBAR_VERTEBRAE and vertebra_name not in LUMBAR_BODIES:
+            logger.warning(f"{vertebra_name} is not a known lumbar vertebra/body. Loading anyway...")
         vertebrae_to_load = [vertebra_name]
     
     # Load masks
