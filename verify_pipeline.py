@@ -214,14 +214,35 @@ class VerificationViewer:
             logger.warning(f"Shape mismatch for {mask_name}: {mask.shape} vs {self.ct_volume.shape}")
             return 0.0
             
-        # Get HU values where mask is present
-        # Note: CT and mask should already be aligned/resampled
-        masked_hu_values = self.ct_volume[mask > 0]
+        total_sum = 0.0
+        total_count = 0
         
-        if masked_hu_values.size == 0:
+        # Iterate through all slices to apply 2D transformations
+        # This ensures consistency with the visual display and slice-based calculation
+        for slice_idx in range(self.axial_shape[2]):
+            # Get CT slice and apply same transformation as in display
+            ct_slice = self.ct_volume[:, :, slice_idx]
+            ct_slice = np.fliplr(ct_slice)  # Flip horizontally
+            
+            # Get mask slice
+            mask_slice = mask[:, :, slice_idx]
+            
+            # Apply same transformations as in display
+            mask_slice = np.rot90(mask_slice, k=-1)  # Rotate 90° clockwise
+            mask_slice = np.flipud(mask_slice)  # Flip vertically
+            
+            # Only include HU values within masked regions
+            if np.any(mask_slice > 0):
+                # Ensure shapes match
+                if ct_slice.shape == mask_slice.shape:
+                    masked_hu_values = ct_slice[mask_slice > 0]
+                    total_sum += np.sum(masked_hu_values)
+                    total_count += masked_hu_values.size
+        
+        if total_count == 0:
             return 0.0
             
-        return float(np.mean(masked_hu_values))
+        return float(total_sum / total_count)
 
     def calculate_average_hu(self, slice_indices: List[int], vertebra_name: Optional[str] = None) -> float:
         """
