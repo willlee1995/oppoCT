@@ -8,6 +8,7 @@ DICOM -> NIfTI -> Segmentation -> Statistics -> Visualization -> CSV Export
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -48,10 +49,12 @@ def process_single_patient(
         Dictionary with patient_id and processing status/results
     """
     patient_id = None
+    start_time = time.perf_counter()
     result = {
         'patient_id': None,
         'status': 'failed',
-        'error': None
+        'error': None,
+        'duration_seconds': None
     }
     
     try:
@@ -145,6 +148,14 @@ def process_single_patient(
         logging.error(error_msg, exc_info=True)
         result['error'] = error_msg
         result['status'] = 'failed'
+    finally:
+        duration = time.perf_counter() - start_time
+        result['duration_seconds'] = duration
+        logging.info(
+            "Total runtime for %s: %.2f seconds",
+            result.get('patient_id') or 'UNKNOWN',
+            duration
+        )
     
     return result
 
@@ -236,6 +247,16 @@ def process_batch(
         )
         
         all_results.append(result)
+        duration = result.get('duration_seconds')
+        if duration is not None:
+            minutes, seconds = divmod(duration, 60)
+            logging.info(
+                "Patient %s runtime: %dm %.1fs (%.2fs total)",
+                result.get('patient_id') or 'UNKNOWN',
+                int(minutes),
+                seconds,
+                duration
+            )
         
         if result['status'] == 'success' and 'statistics' in result:
             all_statistics.append(result['statistics'])

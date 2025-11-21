@@ -1,0 +1,6 @@
+Exam Date,Patient ID,Status,Selected Slice Numbers,Average HU (All),T11 HU,T12 HU,L1 HU,L2 HU,L3 HU,L4 HU,L5 HU,T11 Source,T12 Source,L1 Source,L2 Source,L3 Source,L4 Source,L5 Source
+20250802,10ymalethin,Failed,"237,238,240",476.55,523.39,536.97,496.20,498.03,499.75,511.59,537.14,vertebrae_T11_body,vertebrae_T12_body,vertebrae_L1_body,vertebrae_L2_body,vertebrae_L3_body,vertebrae_L4_body,vertebrae_L5_body
+20250207,12ymalethinwliverclip,Success,"49,50,51",325.59,339.59,335.89,331.67,329.93,340.87,341.97,383.94,vertebrae_T11_body,vertebrae_T12_body,vertebrae_L1_body,vertebrae_L2_body,vertebrae_L3_body,vertebrae_L4_body,vertebrae_L5_body
+20241128,15ymalethin,Failed,"46,47,48",290.80,252.73,277.20,0.00,0.00,0.00,0.00,0.00,vertebrae_T11_body,vertebrae_T12_body,vertebrae_L1_body,vertebrae_L2_body,vertebrae_L3_body,vertebrae_L4_body,vertebrae_L5_body
+20250428,5yrmalethin,Success,"41,52,53",381.50,377.43,357.82,359.41,351.73,370.09,377.81,477.03,vertebrae_T11_body,vertebrae_T12_body,vertebrae_L1_body,vertebrae_L2_body,vertebrae_L3_body,vertebrae_L4_body,vertebrae_L5_body
+20250818,7yrfemalethin,Success,"19,20,21",397.78,384.77,364.99,375.25,378.74,382.69,403.37,416.79,vertebrae_T11_body,vertebrae_T12_body,vertebrae_L1_body,vertebrae_L2_body,vertebrae_L3_body,vertebrae_L4_body,vertebrae_L5_body
