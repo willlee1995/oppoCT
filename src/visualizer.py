@@ -28,18 +28,21 @@ VERTEBRAE_COLORS = {
     'vertebrae_L2_body': 'orange',
     'vertebrae_L3_body': 'yellow',
     'vertebrae_L4_body': 'green',
-    'vertebrae_L5_body': 'blue'
+    'vertebrae_L5_body': 'blue',
+    'vertebrae_body': 'cyan'
 }
 
-# Define the list of vertebrae to process
+# Define the list of vertebrae to process for visualization
+# Using _body suffix to show only vertebral bodies as requested
 LUMBAR_VERTEBRAE = [
-    'vertebrae_T11',
-    'vertebrae_T12',
-    'vertebrae_L1',
-    'vertebrae_L2',
-    'vertebrae_L3',
-    'vertebrae_L4',
-    'vertebrae_L5'
+    'vertebrae_T11_body',
+    'vertebrae_T12_body',
+    'vertebrae_L1_body',
+    'vertebrae_L2_body',
+    'vertebrae_L3_body',
+    'vertebrae_L4_body',
+    'vertebrae_L5_body',
+    'vertebrae_body'
 ]
 
 def find_representative_slices(ct_volume: np.ndarray, masks: Dict[str, np.ndarray], num_slices: int = 3) -> List[int]:
@@ -119,7 +122,10 @@ def create_preview(
     
     # Create plot
     plt.figure(figsize=(10, 10))
-    plt.imshow(ct_display, cmap='gray', origin='lower')
+    # Transpose to (Rows, Cols) for display so Spine is at Bottom (High Y)
+    # Default origin='upper' puts (0,0) at top. 
+    # Row 0 (Anterior) -> Top. Row N (Posterior) -> Bottom.
+    plt.imshow(ct_display.T, cmap='gray')
     
     # Overlay masks
     for name, mask in segmentation_masks.items():
@@ -127,7 +133,8 @@ def create_preview(
             mask_slice = mask[:, :, best_slice]
             if np.any(mask_slice):
                 color = VERTEBRAE_COLORS.get(name, 'red')
-                plt.contour(mask_slice, levels=[0.5], colors=[color], linewidths=2)
+                # Now that affine is correct, mask and image should align in voxel space
+                plt.contour(mask_slice.T, levels=[0.5], colors=[color], linewidths=2)
                 
     plt.title(f"Preview - Slice {best_slice}")
     plt.axis('off')

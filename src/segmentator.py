@@ -64,7 +64,17 @@ def segment_lumbar_vertebrae(
         else:
             logging.info(f"Segmenting lumbar vertebrae from NIfTI: {nifti_path}")
         logging.info(f"Output directory: {output_dir}")
-    
+
+    # Check device availability
+    import torch
+    if device == 'gpu' and not torch.cuda.is_available():
+        logging.warning("GPU requested but verify `torch.cuda.is_available()` is False. TotalSegmentator will likely fall back to CPU or fail.")
+    elif device == 'gpu':
+        try:
+             logging.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        except:
+             pass
+
     # Determine if preview can be enabled (Linux/WSL supports it, Windows native doesn't)
     enable_preview = platform.system() != 'Windows'
     

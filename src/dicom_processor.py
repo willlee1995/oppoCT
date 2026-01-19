@@ -81,9 +81,9 @@ def load_dicom_series(dicom_folder: Path) -> Tuple[np.ndarray, dict]:
     cols = first_slice.Columns
     num_slices = len(slices)
     
-    # Initialize volume with correct shape: (Rows, Columns, Slices)
-    # This matches TotalSegmentator's expected format: (height, width, depth)
-    volume = np.zeros((rows, cols, num_slices), dtype=np.float32)
+    # Initialize volume with correct shape: (Columns, Rows, Slices) -> (X, Y, Z)
+    # This matches NIfTI standard and standard affine construction
+    volume = np.zeros((cols, rows, num_slices), dtype=np.float32)
     
     # Load slices into volume
     for i, slice_ds in enumerate(slices):
@@ -93,8 +93,8 @@ def load_dicom_series(dicom_folder: Path) -> Tuple[np.ndarray, dict]:
         if hasattr(slice_ds, 'RescaleSlope') and hasattr(slice_ds, 'RescaleIntercept'):
             pixel_array = pixel_array * slice_ds.RescaleSlope + slice_ds.RescaleIntercept
         
-        # Assign to volume: (rows, cols, slice_index)
-        volume[:, :, i] = pixel_array
+        # Assign to volume: (cols, rows, slice_index) - Transpose needed because DICOM is (Row, Col)
+        volume[:, :, i] = pixel_array.T
     
     # Create metadata dictionary
     metadata = {
@@ -128,15 +128,66 @@ def dicom_to_nifti(dicom_folder: Path, output_path: Optional[Path] = None) -> Tu
     # Create affine matrix
     spacing = metadata['spacing']
     origin = metadata['origin']
+    direction = metadata['direction']
     
-    # Simple affine matrix (can be improved with proper direction cosines)
     affine = np.eye(4)
-    affine[0, 0] = spacing[2]  # x spacing
-    affine[1, 1] = spacing[1]  # y spacing
-    affine[2, 2] = spacing[0]  # z spacing
+    
+    if direction and len(direction) >= 6:
+        # Direction cosines from ImageOrientationPatient
+        # IOP: [Rx, Ry, Rz, Cx, Cy, Cz]
+        # X-axis (Cols) corresponds to first triplet
+        # Y-axis (Rows) corresponds to second triplet
+        
+        # Volume has shape (Cols, Rows, Slices) because we used pixel_array.T
+        # spacing: [z, y, x] (from above metadata creation)
+        # spacing[2] is X spacing (cols)
+        # spacing[1] is Y spacing (rows)
+        # spacing[0] is Z spacing (slices)
+        
+        rx, ry, rz = direction[0], direction[1], direction[2]
+        cx, cy, cz = direction[3], direction[4], direction[5]
+        
+        # Calculate Z direction (slice normal) using cross product
+        # Cross product of X and Y gives Z
+        # Note: DICOM uses LCS (Left Handed)? No, RCS usually.
+        # But let's stick to simple vector math.
+        # r = vector along row (increasing column index) -> My volume dim 0 (Cols)
+        # c = vector along column (increasing row index) -> My volume dim 1 (Rows)
+        
+        norm_r = np.array([rx, ry, rz])
+        norm_c = np.array([cx, cy, cz])
+        norm_s = np.cross(norm_r, norm_c)
+        
+        # Set affine rotation part (scaled by spacing)
+        # Column 0: X axis (Cols) -> norm_r * spacing_x
+        affine[0:3, 0] = norm_r * spacing[2]
+        
+        # Column 1: Y axis (Rows) -> norm_c * spacing_y
+        affine[0:3, 1] = norm_c * spacing[1]
+        
+        # Column 2: Z axis (Slices) -> norm_s * spacing_z
+        # Note: This assumes equal slice spacing and no gantry tilt issues for Z
+        affine[0:3, 2] = norm_s * spacing[0]
+        
+        # Set affine translation (Origin) - ImagePositionPatient
+        affine[0:3, 3] = origin
+        
+    else:
+        # Fallback to simple identity scaling
+        affine[0, 0] = spacing[2]  # x spacing
+        affine[1, 1] = spacing[1]  # y spacing
+        affine[2, 2] = spacing[0]  # z spacing
+
+    # Set translation (Origin)
     affine[0, 3] = origin[0] if len(origin) > 0 else 0
     affine[1, 3] = origin[1] if len(origin) > 1 else 0
     affine[2, 3] = origin[2] if len(origin) > 2 else 0
+    
+    # Convert from DICOM LPS to NIfTI RAS coordinate system
+    # Negate X and Y rows (0 and 1) to flip Left->Right and Posterior->Anterior
+    # This transforms the affine matrix to map current voxel indices to RAS space
+    affine[0, :] = -affine[0, :]
+    affine[1, :] = -affine[1, :]
     
     # Create NIfTI image
     nifti_img = nib.Nifti1Image(volume, affine)

@@ -59,6 +59,8 @@ Process a single patient folder:
 python run_pipeline.py /path/to/patient_dicom_folder /path/to/output_directory
 ```
 
+
+
 Process a batch of patients (directory containing multiple patient folders):
 ```bash
 python run_pipeline.py /path/to/patients_directory /path/to/output_directory

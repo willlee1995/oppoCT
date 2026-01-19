@@ -4,13 +4,19 @@ Helper script to check PyTorch CUDA availability and provide installation instru
 """
 
 import sys
-
+import platform
 
 def check_pytorch_cuda():
     """Check if PyTorch can detect CUDA."""
+    print("=" * 60)
+    print("System Information")
+    print("=" * 60)
+    print(f"OS: {platform.system()} {platform.release()}")
+    print(f"Python: {sys.version}")
+    
     try:
         import torch
-        print("=" * 60)
+        print("\n" + "=" * 60)
         print("PyTorch CUDA Status Check")
         print("=" * 60)
         print(f"PyTorch version: {torch.__version__}")
@@ -18,6 +24,34 @@ def check_pytorch_cuda():
         
         if torch.cuda.is_available():
             print(f"CUDA version: {torch.version.cuda}")
+            print(f"Device count: {torch.cuda.device_count()}")
+            print(f"Current device: {torch.cuda.current_device()}")
+            print(f"Device name: {torch.cuda.get_device_name(0)}")
+        else:
+            print("\nWARNING: PyTorch cannot detect a GPU.")
+            print("Please ensure you have installed the CUDA-enabled version of PyTorch.")
+            print("Run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121")
+            
+    except ImportError:
+        print("\nERROR: PyTorch is not installed.")
+
+    try:
+        print("\n" + "=" * 60)
+        print("TotalSegmentator Check")
+        print("=" * 60)
+        from totalsegmentator.python_api import totalsegmentator
+        import importlib.metadata
+        try:
+             ts_version = importlib.metadata.version("totalsegmentator")
+             print(f"TotalSegmentator version: {ts_version}")
+        except:
+             print("TotalSegmentator installed (version unknown)")
+             
+    except ImportError:
+        print("TotalSegmentator NOT installed.")
+
+if __name__ == "__main__":
+    check_pytorch_cuda()
             print(f"cuDNN version: {torch.backends.cudnn.version()}")
             print(f"Number of GPUs: {torch.cuda.device_count()}")
             for i in range(torch.cuda.device_count()):

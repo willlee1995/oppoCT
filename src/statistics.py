@@ -20,7 +20,8 @@ LUMBAR_VERTEBRAE = [
     'vertebrae_L2',
     'vertebrae_L3',
     'vertebrae_L4',
-    'vertebrae_L5'
+    'vertebrae_L5',
+    'vertebrae_body'
 ]
 
 
