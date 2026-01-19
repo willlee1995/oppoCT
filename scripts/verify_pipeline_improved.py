@@ -13,8 +13,12 @@ Usage:
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 from typing import Dict, Tuple
+
+# Add project root to sys.path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import matplotlib
 import matplotlib.pyplot as plt

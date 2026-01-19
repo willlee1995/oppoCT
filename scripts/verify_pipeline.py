@@ -13,6 +13,9 @@ import logging
 import sys
 from pathlib import Path
 
+# Add project root to sys.path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
 import nibabel as nib
 import numpy as np
 from nibabel.processing import resample_from_to
