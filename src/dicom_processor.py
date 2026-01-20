@@ -192,6 +192,9 @@ def dicom_to_nifti(dicom_folder: Path, output_path: Optional[Path] = None) -> Tu
     # Create NIfTI image
     nifti_img = nib.Nifti1Image(volume, affine)
     
+    # Ensure canonical orientation (RAS+) limits orientation issues with TotalSegmentator
+    nifti_img = nib.as_closest_canonical(nifti_img)
+    
     # Save if output path provided
     if output_path:
         output_path.parent.mkdir(parents=True, exist_ok=True)

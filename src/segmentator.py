@@ -91,17 +91,23 @@ def segment_lumbar_vertebrae(
             input_path = str(nifti_path)
         
         # 1. Run vertebrae_body task to get the body masks (unlabeled levels)
+        # This will produce 'vertebrae_body.nii.gz'
+        # IMPORTANT: When ml=True, output must be a file path, not a directory
+        body_mask_path = output_dir / "vertebrae_body.nii.gz"
         totalsegmentator(
             input=input_path,
-            output=str(output_dir),
+            output=str(body_mask_path),
             task="vertebrae_body",
-            fast=fast,
+            fast=False,  # vertebrae_body task does not support fast mode
             device=device,
             verbose=verbose,
-            preview=enable_preview
+            preview=enable_preview,
+            ml=True  # Save as multilabel to get a single file (merged or single class)
         )
 
         # 2. Run total task with ROI subset to get labeled whole vertebrae (L1-L5)
+        # This will produce 'vertebrae_L1.nii.gz', 'vertebrae_L2.nii.gz', etc.
+        # These are the "untempered" whole vertebrae masks.
         if verbose:
             logging.info("Segmenting labeled vertebrae (L1-L5) using TotalSegmentator...")
         

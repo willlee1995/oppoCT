@@ -87,8 +87,9 @@ def process_single_patient(
                 voxel_spacing = [float(spacing[0]), float(spacing[1]), float(spacing[2])]
         
         # Step 4: Segment lumbar vertebrae
-        # Use the converted NIfTI file as input to ensure coordinate system consistency.
-        # This guarantees that the output segmentation maps 1:1 to the image we visualize.
+        # We process directly from DICOM to ensure unmodified TotalSegmentator results.
+        # The NIfTI conversion above is kept for statistics and visualization reference,
+        # and we've ensured it uses canonical orientation to match TotalSegmentator's output.
         logging.info("Segmenting lumbar vertebrae...")
         segment_lumbar_vertebrae(
             nifti_path=temp_nifti_path,
@@ -96,8 +97,8 @@ def process_single_patient(
             fast=fast_segmentation,
             device=device,
             verbose=True,
-            use_dicom_directly=False,  # Ensure we use our custom NIfTI
-            dicom_dir=None
+            use_dicom_directly=True,
+            dicom_dir=dicom_folder
         )
         
         # Verify segmentation output
