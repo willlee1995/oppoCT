@@ -6,6 +6,7 @@ select slices for HU calculation, and saves validation results to CSV.
 
 Usage:
     python verify_pipeline.py --input-dir /path/to/patients --output-csv validation_results.csv
+    python scripts/verify_pipeline.py data/Plain5mmSTD out/test_verification_2
 """
 
 import argparse
@@ -1203,25 +1204,35 @@ Examples:
     )
     
     parser.add_argument(
-        '--input-dir',
+        'input_path',
         type=Path,
-        required=True,
         help='Input directory containing patient DICOM folders'
+    )
+    
+    parser.add_argument(
+        'output_dir',
+        type=Path,
+        help='Output directory where results and segmentations will be saved'
     )
     
     parser.add_argument(
         '--output-csv',
         type=Path,
-        required=True,
-        help='Output CSV file path for validation results'
+        default=None,
+        help='Output CSV file path for validation results (default: <output_dir>/validation_results.csv)'
     )
     
     parser.add_argument(
         '--output-base-dir',
         type=Path,
         default=None,
-        help='Base directory for processing outputs (default: ./verification_output). '
-             'If segmentations already exist in this directory, they will be reused to skip reprocessing.'
+        help='DEPRECATED: Use positional output_dir instead.'
+    )
+    
+    parser.add_argument(
+        '--input-dir',
+        type=Path,
+        help='DEPRECATED: Use positional input_path instead.'
     )
     
     parser.add_argument(
@@ -1254,16 +1265,27 @@ Examples:
     
     args = parser.parse_args()
     
+    # Handle deprecated arguments for backward compatibility
+    if args.input_dir and not args.input_path:
+        args.input_path = args.input_dir
+        
+    if args.output_base_dir and not args.output_dir:
+        args.output_dir = args.output_base_dir
+
     # Validate input
-    if not args.input_dir.exists():
-        logger.error(f"Input directory does not exist: {args.input_dir}")
+    if not args.input_path.exists():
+        logger.error(f"Input directory does not exist: {args.input_path}")
         sys.exit(1)
+        
+    # Default CSV path if not provided
+    if args.output_csv is None:
+        args.output_csv = args.output_dir / 'validation_results.csv'
     
     try:
         run_verification_pipeline(
-            input_path=args.input_dir,
+            input_path=args.input_path,
             output_csv=args.output_csv,
-            output_base_dir=args.output_base_dir,
+            output_base_dir=args.output_dir,
             fast_segmentation=args.fast,
             device=args.device,
             window_level=args.window_level,

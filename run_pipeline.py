@@ -4,6 +4,7 @@ CLI Entry Point for Lumbar Spine CT Segmentation Pipeline
 
 Usage:
     python run_pipeline.py <input_path> <output_dir> [options]
+    python run_pipeline.py data/Plain5mmSTD out/test_4
 Options:
     --fast                 Use fast segmentation mode (lower quality, faster processing)
     --verbose              Enable verbose logging
