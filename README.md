@@ -7,6 +7,7 @@ A platform-agnostic Python pipeline for batch processing abdominal CT DICOM fold
 - **Batch Processing**: Process multiple patients' CT scans in a single run
 - **Patient Organization**: Automatically organizes output by patient ID extracted from DICOM metadata
 - **Lumbar Vertebrae Segmentation**: Segments only L1-L5 vertebrae using TotalSegmentator
+- **Trabecular Core Generation**: Automatically generates a trabecular core mask for L1 body by eroding 2.5mm
 - **HU Intensity Statistics**: Calculates mean HU intensity and volume for each vertebra
 - **Visualization**: Generates preview images showing segmented vertebrae overlaid on CT slices
 - **Multiple Output Formats**: Exports results in both JSON and CSV formats
@@ -146,6 +147,7 @@ output_directory/
 │   ├── PATIENT001_preview.png    # Segmentation preview image
 │   └── segmentations/             # Segmentation masks
 │       ├── vertebrae_L1.nii.gz
+│       ├── vertebrae_L1_body_trabecular_core.nii.gz
 │       ├── vertebrae_L2.nii.gz
 │       ├── vertebrae_L3.nii.gz
 │       ├── vertebrae_L4.nii.gz
