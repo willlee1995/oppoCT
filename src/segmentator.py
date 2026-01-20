@@ -11,6 +11,7 @@ from typing import List, Optional
 
 import nibabel as nib
 import numpy as np
+from scipy import ndimage
 
 try:
     from totalsegmentator.python_api import totalsegmentator
@@ -29,6 +30,56 @@ LUMBAR_VERTEBRAE = [
     'vertebrae_L4',
     'vertebrae_L5'
 ]
+
+
+def generate_trabecular_core(output_dir: Path, verbose: bool = True) -> None:
+    """
+    Generate trabecular core mask for L1 body by eroding 2.5mm.
+    
+    Args:
+        output_dir: Directory containing segmentation masks
+        verbose: Print progress messages
+    """
+    l1_body_path = output_dir / "vertebrae_L1_body.nii.gz"
+    if not l1_body_path.exists():
+        if verbose:
+            logging.warning("vertebrae_L1_body.nii.gz not found, skipping trabecular core generation.")
+        return
+
+    try:
+        img = nib.load(str(l1_body_path))
+        data = img.get_fdata()
+        affine = img.affine
+        header = img.header
+        
+        # Get voxel spacing to calculate erosion distance in pixels
+        zooms = header.get_zooms()
+        # Use only first 3 dimensions (x, y, z)
+        sampling = zooms[:3]
+        
+        if verbose:
+            logging.info(f"Generating L1 trabecular core (erosion 2.5mm, spacing: {sampling})")
+            
+        # Use distance transform for accurate metric erosion
+        # Calculate distance from background (0)
+        dt = ndimage.distance_transform_edt(data, sampling=sampling)
+        
+        # Create core mask (keep pixels > 2.5mm from boundary)
+        core_mask = dt > 2.5
+        core_mask = core_mask.astype(np.uint8)
+        
+        # Save result
+        out_name = "vertebrae_L1_body_trabecular_core.nii.gz"
+        out_path = output_dir / out_name
+        
+        new_img = nib.Nifti1Image(core_mask, affine, header)
+        nib.save(new_img, str(out_path))
+        
+        if verbose:
+            logging.info(f"Generated {out_name}")
+            
+    except Exception as e:
+        logging.error(f"Error generating trabecular core: {e}")
 
 
 def segment_lumbar_vertebrae(
@@ -168,6 +219,9 @@ def segment_lumbar_vertebrae(
             logging.error(f"Error during intersection: {e}")
             # Don't raise here, we still have partial results? 
             # Or maybe we should raise. Let's log and continue cleanup.
+        
+        # Generate trabecular core for L1
+        generate_trabecular_core(output_dir, verbose)
         
         # Clean up any non-vertebrae files that might exist
         _cleanup_non_vertebrae_files(output_dir, verbose)
