@@ -33,7 +33,8 @@ def process_single_patient(
     temp_dir: Optional[Path] = None,
     fast_segmentation: bool = False,
     device: str = 'gpu',
-    keep_temp_files: bool = False
+    keep_temp_files: bool = False,
+    forced_study_id: Optional[str] = None
 ) -> Dict:
     """
     Process a single patient through the entire pipeline.
@@ -45,6 +46,7 @@ def process_single_patient(
         fast_segmentation: Use fast segmentation mode
         device: Device for segmentation ('gpu' or 'cpu')
         keep_temp_files: Keep temporary NIfTI files
+        forced_study_id: Optional forced study ID (e.g., with suffix) to use for output folder
         
     Returns:
         Dictionary with patient_id and processing status/results
@@ -66,7 +68,9 @@ def process_single_patient(
         logging.info(f"Patient ID: {patient_id}")
         
         # Step 2: Create patient output directory
-        patient_output_dir = create_patient_output_dir(output_base_dir, patient_id)
+        # Use provided forced_study_id or fallback to folder name
+        study_folder_name = forced_study_id if forced_study_id else dicom_folder.name
+        patient_output_dir = create_patient_output_dir(output_base_dir, patient_id, study_id=study_folder_name)
         segmentations_dir = patient_output_dir / 'segmentations'
         
         # Step 3: Convert DICOM to NIfTI
@@ -226,10 +230,36 @@ def process_batch(
     all_results = []
     all_statistics = []
     
+    # Track study folder usage to handle duplicated folder names
+    # Key: (patient_id, study_folder_name), Value: count
+    study_counts: Dict[str, int] = {}
+    
     for i, patient_folder in enumerate(patient_folders, 1):
         logging.info(f"\n{'='*60}")
         logging.info(f"Processing patient {i}/{len(patient_folders)}: {patient_folder.name}")
         logging.info(f"{'='*60}")
+        
+        # Pre-calculate unique study ID for this batch run
+        try:
+            # We need patient_id before processing to track duplicates
+            # This mimics what process_single_patient does
+            temp_pid = extract_patient_id(patient_folder)
+            study_name = patient_folder.name
+            
+            # Construct key for tracking
+            key = f"{temp_pid}_{study_name}"
+            count = study_counts.get(key, 0)
+            study_counts[key] = count + 1
+            
+            # Generate suffix if needed (first one is clean, subsequent get _1, _2)
+            forced_study_id = study_name
+            if count > 0:
+                forced_study_id = f"{study_name}_{count}"
+                logging.info(f"Duplicate study folder detected for {temp_pid}/{study_name}. Using suffix: {forced_study_id}")
+                
+        except Exception:
+            # If extraction fails here, let process_single_patient handle errors
+            forced_study_id = None
         
         result = process_single_patient(
             dicom_folder=patient_folder,
@@ -237,7 +267,8 @@ def process_batch(
             temp_dir=temp_dir,
             fast_segmentation=fast_segmentation,
             device=device,
-            keep_temp_files=keep_temp_files
+            keep_temp_files=keep_temp_files,
+            forced_study_id=forced_study_id
         )
         
         all_results.append(result)

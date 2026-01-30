@@ -2,6 +2,9 @@
 Visualization Module
 
 Generates preview images showing segmented vertebrae overlaid on original CT images.
+
+WARNING: DO NOT CHANGE IMAGE ORIENTATION/DISPLAY LOGIC.
+The transforms in this module are verified and fixed.
 """
 
 import logging

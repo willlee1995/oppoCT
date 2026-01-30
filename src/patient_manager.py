@@ -108,29 +108,40 @@ def get_patient_metadata(dicom_folder: Path) -> Dict[str, Optional[str]]:
     return metadata
 
 
-def create_patient_output_dir(base_output_dir: Path, patient_id: str) -> Path:
+def create_patient_output_dir(base_output_dir: Path, patient_id: str, study_id: Optional[str] = None) -> Path:
     """
     Create patient-specific output directory structure.
     
     Args:
         base_output_dir: Base output directory
         patient_id: Patient identifier
+        study_id: Optional study identifier/folder name to create subfolder
         
     Returns:
-        Path to patient-specific output directory
+        Path to patient (or study) specific output directory
     """
     # Normalize patient ID for directory name
     normalized_id = normalize_patient_id(patient_id)
     
     # Create patient directory
     patient_dir = base_output_dir / normalized_id
-    patient_dir.mkdir(parents=True, exist_ok=True)
+    
+    # If study_id is provided, create a subdirectory for the study
+    if study_id:
+        # Sanitize study_id for file system
+        # Use regex to replace invalid characters (like : / \ etc) with underscores
+        safe_study_id = re.sub(r'[\\/*?:"<>|]', '_', str(study_id))
+        output_dir = patient_dir / safe_study_id
+    else:
+        output_dir = patient_dir
+        
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     # Create segmentations subdirectory
-    segmentations_dir = patient_dir / 'segmentations'
+    segmentations_dir = output_dir / 'segmentations'
     segmentations_dir.mkdir(exist_ok=True)
     
-    return patient_dir
+    return output_dir
 
 
 def extract_patient_id_from_folder(dicom_folder: Path) -> str:

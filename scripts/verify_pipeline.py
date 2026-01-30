@@ -4,9 +4,12 @@ Interactive Verification Pipeline
 Shows cases one by one with sagittal view, allows user to mark success/failure,
 select slices for HU calculation, and saves validation results to CSV.
 
+for best performance, set NUMEXPR_MAX_THREADS to limit CPU usage, e.g. in PowerShell:
+$env:NUMEXPR_MAX_THREADS="20"
+
 Usage:
     python verify_pipeline.py --input-dir /path/to/patients --output-csv validation_results.csv
-    python scripts/verify_pipeline.py data/Plain5mmSTD out/test_verification_2
+    python scripts/verify_pipeline.py data/processed out/real_1 --output-csv result.csv
 """
 
 import argparse
@@ -79,6 +82,7 @@ VERTEBRAE_COLORS = {
     'vertebrae_L3_body': '#B8860B',  # Dark Goldenrod
     'vertebrae_L4_body': '#006400',  # Dark Green
     'vertebrae_L5_body': '#00008B',  # Dark Blue
+    'vertebrae_L1_body_trabecular_core': '#00FF7F',  # Spring Green
 }
 
 LUMBAR_VERTEBRAE = ['vertebrae_T11', 'vertebrae_T12', 'vertebrae_L1', 'vertebrae_L2', 'vertebrae_L3', 'vertebrae_L4', 'vertebrae_L5']
@@ -86,7 +90,13 @@ LUMBAR_BODIES = [f"{v}_body" for v in LUMBAR_VERTEBRAE]
 
 
 class VerificationViewer:
-    """Interactive viewer for case-by-case verification with sagittal view."""
+    """
+    Interactive viewer for case-by-case verification with sagittal view.
+    
+    WARNING: DO NOT CHANGE IMAGE ORIENTATION/DISPLAY LOGIC.
+    The transforms (fliplr, rot90, etc.) in this class are verified and fixed.
+    Modifying them will break the visualization alignment.
+    """
     
     def __init__(
         self,
@@ -201,13 +211,13 @@ class VerificationViewer:
         Calculate average HU value for the entire volume of a specific vertebra.
         
         Args:
-            vertebra_name: Target label (e.g., 'L1')
+            vertebra_name: Target label (e.g., 'L1') OR direct mask name
             
         Returns:
             Average HU value within the entire mask
         """
-        # Get the source mask name from mapping
-        mask_name = self.label_mapping.get(vertebra_name)
+        # Get the source mask name from mapping, or use name directly if not mapped
+        mask_name = self.label_mapping.get(vertebra_name, vertebra_name)
         if not mask_name or mask_name not in self.masks:
             return 0.0
             
@@ -640,11 +650,24 @@ class VerificationViewer:
             selected_str = ', '.join(map(str, self.selected_slices)) if self.selected_slices else 'None'
             avg_hu = self.calculate_average_hu(self.selected_slices) if self.selected_slices else 0.0
             
+            # Additional logic for L1 Core vs Body check
+            l1_body_hu = self.calculate_volumetric_hu('vertebrae_L1_body')
+            l1_core_hu = self.calculate_volumetric_hu('vertebrae_L1_body_trabecular_core')
+            
             info = f"Patient ID: {self.patient_id}\n"
             info += f"Exam Date: {self.exam_date or 'N/A'}\n"
             info += f"Status: {status}\n"
             info += f"Selected Slices: {selected_str}\n"
-            info += f"Average HU: {avg_hu:.1f}"
+            info += f"Average HU: {avg_hu:.1f}\n"
+
+            # Display L1 Core/Body stats
+            if l1_body_hu != 0 or l1_core_hu != 0:
+                info += f"L1 Body HU: {l1_body_hu:.1f}\n"
+                info += f"L1 Core HU: {l1_core_hu:.1f}"
+                
+                # Warning check
+                if l1_core_hu > l1_body_hu and l1_body_hu != 0:
+                     info += f"\nWARNING: Core > Body HU!"
             
             self.info_text.set_text(info)
             # Use darker colors for better visibility
@@ -654,6 +677,11 @@ class VerificationViewer:
                 status_color = 'darkgreen'
             elif status_color == 'red':
                 status_color = 'darkred'
+                
+            # If there is a warning, make the text red if it wasn't already green/red
+            if "WARNING" in info and status_color == 'black':
+                 status_color = 'red'
+
             self.info_text.set_color(status_color)
             self.fig.canvas.draw_idle()
     
@@ -845,7 +873,8 @@ class VerificationViewer:
             'vertebra_hu': {
                 label: self.calculate_volumetric_hu(label) # Volumetric average (all pixels)
                 for label in ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']
-            }
+            },
+            'l1_trabecular_core_hu': self.calculate_volumetric_hu('vertebrae_L1_body_trabecular_core')
         }
 
 
@@ -887,7 +916,8 @@ def process_case_for_verification(
     temp_dir: Optional[Path] = None,
     fast_segmentation: bool = False,
     device: str = 'gpu',
-    skip_if_exists: bool = True
+    skip_if_exists: bool = True,
+    forced_study_id: Optional[str] = None
 ) -> Tuple[Path, str, Optional[str], bool]:
     """
     Process a single case through the pipeline to get segmentation results.
@@ -904,7 +934,9 @@ def process_case_for_verification(
         
         # Get segmentation directory
         from src.patient_manager import create_patient_output_dir
-        patient_output_dir = create_patient_output_dir(output_base_dir, patient_id)
+        # Use provided forced_study_id or fallback to folder name
+        study_folder_name = forced_study_id if forced_study_id else dicom_folder.name
+        patient_output_dir = create_patient_output_dir(output_base_dir, patient_id, study_id=study_folder_name)
         segmentation_dir = patient_output_dir / 'segmentations'
         
         # Check if segmentations already exist
@@ -921,7 +953,8 @@ def process_case_for_verification(
             temp_dir=temp_dir,
             fast_segmentation=fast_segmentation,
             device=device,
-            keep_temp_files=True  # Keep temp files for verification
+            keep_temp_files=True,  # Keep temp files for verification
+            forced_study_id=study_folder_name
         )
         
         if result['status'] != 'success':
@@ -975,6 +1008,26 @@ def load_masks_for_verification(segmentation_dir: Path, ct_img: nib.Nifti1Image)
             except Exception as e:
                 logger.warning(f"Failed to load mask {mask_path}: {e}")
     
+    # Check for L1 trabecular core
+    core_name = 'vertebrae_L1_body_trabecular_core'
+    core_mask_path = segmentation_dir / f"{core_name}.nii.gz"
+    if core_mask_path.exists():
+        try:
+            logger.info(f"Loading {core_name} mask")
+            mask_img = load_segmentation_mask(core_mask_path)
+            mask_shape = mask_img.shape[:3]
+            
+            if mask_shape != ct_shape:
+                logger.info(f"Resampling {core_name} mask from {mask_shape} to {ct_shape}")
+                resampled_mask_img = resample_from_to(mask_img, ct_img, order=0)
+                mask_data = resampled_mask_img.get_fdata()
+            else:
+                mask_data = mask_img.get_fdata()
+            
+            masks[core_name] = mask_data
+        except Exception as e:
+            logger.warning(f"Failed to load core mask {core_mask_path}: {e}")
+
     # If no individual masks found, try loading vertebrae_body (single combined mask)
     if not masks:
         vertebrae_body_path = segmentation_dir / "vertebrae_body.nii.gz"
@@ -1066,6 +1119,10 @@ def run_verification_pipeline(
     # Results storage
     all_results = []
     
+    # Track study folder usage to handle duplicated folder names
+    # Key: (patient_id, study_folder_name), Value: count
+    study_counts: Dict[str, int] = {}
+    
     # Process each case
     for i, patient_folder in enumerate(patient_folders, 1):
         logger.info(f"\n{'='*60}")
@@ -1073,6 +1130,28 @@ def run_verification_pipeline(
         logger.info(f"{'='*60}")
         
         try:
+            # Pre-calculate unique study ID for this batch run
+            try:
+                # We need patient_id before processing to track duplicates
+                temp_metadata = get_patient_metadata(patient_folder)
+                temp_pid = temp_metadata.get('patient_id') or patient_folder.name
+                study_name = patient_folder.name
+                
+                # Construct key for tracking
+                key = f"{temp_pid}_{study_name}"
+                count = study_counts.get(key, 0)
+                study_counts[key] = count + 1
+                
+                # Generate suffix if needed (first one is clean, subsequent get _1, _2)
+                forced_study_id = study_name
+                if count > 0:
+                    forced_study_id = f"{study_name}_{count}"
+                    logger.info(f"Duplicate study folder detected for {temp_pid}/{study_name}. Using suffix: {forced_study_id}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to pre-calculate suffix: {e}")
+                forced_study_id = None
+                
             # Process case through pipeline (or use existing segmentations)
             segmentation_dir, patient_id, exam_date, was_skipped = process_case_for_verification(
                 dicom_folder=patient_folder,
@@ -1080,7 +1159,8 @@ def run_verification_pipeline(
                 temp_dir=temp_dir,
                 fast_segmentation=fast_segmentation,
                 device=device,
-                skip_if_exists=True
+                skip_if_exists=True,
+                forced_study_id=forced_study_id
             )
             
             if was_skipped:
@@ -1162,6 +1242,7 @@ def save_verification_results(results: List[Dict], output_csv: Path):
         is_successful = result.get('is_successful')
         selected_slices = result.get('selected_slices', [])
         average_hu = result.get('average_hu')
+        l1_core_hu = result.get('l1_trabecular_core_hu')
         
         # Format selected slices as comma-separated string
         slice_numbers = ','.join(map(str, selected_slices)) if selected_slices else ''
@@ -1172,6 +1253,7 @@ def save_verification_results(results: List[Dict], output_csv: Path):
             'Status': 'Success' if is_successful else ('Failed' if is_successful is False else 'Not Marked'),
             'Selected Slice Numbers': slice_numbers,
             'Average HU (All)': f"{average_hu:.2f}" if average_hu is not None else '',
+            'L1 Trabecular Core HU': f"{l1_core_hu:.2f}" if l1_core_hu is not None and l1_core_hu != 0 else '',
             # Add per-vertebra columns
             **{f"{v} HU": f"{result.get('vertebra_hu', {}).get(v, 0.0):.2f}" for v in ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']},
             **{f"{v} Source": result.get('label_mapping', {}).get(v, '') for v in ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']}

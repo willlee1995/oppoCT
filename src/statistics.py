@@ -21,7 +21,9 @@ LUMBAR_VERTEBRAE = [
     'vertebrae_L3',
     'vertebrae_L4',
     'vertebrae_L5',
-    'vertebrae_body'
+    'vertebrae_body',
+    'vertebrae_L1_body',
+    'vertebrae_L1_body_trabecular_core'
 ]
 
 
