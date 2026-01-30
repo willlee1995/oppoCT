@@ -6,6 +6,7 @@ DICOM -> NIfTI -> Segmentation -> Statistics -> Visualization -> CSV Export
 """
 
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -164,7 +165,7 @@ def process_single_patient(
 
 def find_patient_folders(input_path: Path) -> List[Path]:
     """
-    Find patient DICOM folders in input directory.
+    Find patient DICOM folders in input directory (recursively).
     
     Args:
         input_path: Input path (file or directory)
@@ -178,22 +179,13 @@ def find_patient_folders(input_path: Path) -> List[Path]:
         # Single file - use parent directory
         patient_folders.append(input_path.parent)
     elif input_path.is_dir():
-        # Check if directory contains DICOM files directly
-        dicom_files = list(input_path.glob('*.dcm')) + list(input_path.glob('*.DCM'))
-        
-        if dicom_files:
-            # Directory contains DICOM files - treat as single patient
-            patient_folders.append(input_path)
-        else:
-            # Directory contains subdirectories - treat each as a patient
-            for subdir in input_path.iterdir():
-                if subdir.is_dir():
-                    # Check if subdirectory contains DICOM files
-                    subdir_dicom = list(subdir.glob('*.dcm')) + list(subdir.glob('*.DCM'))
-                    if subdir_dicom:
-                        patient_folders.append(subdir)
+        # Recursively search for directories containing DICOM files
+        for root, _, files in os.walk(input_path):
+            if any(f.lower().endswith('.dcm') for f in files):
+                patient_folders.append(Path(root))
     
-    return patient_folders
+    # Sort for consistent processing order
+    return sorted(list(set(patient_folders)))
 
 
 def process_batch(
