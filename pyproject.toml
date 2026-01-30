@@ -11,6 +11,9 @@ dependencies = [
     "pandas>=2.0.0",
     "matplotlib>=3.7.0",
     "scipy>=1.10.0",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "torchaudio>=2.0.0",
 ]
 
 [build-system]
@@ -42,3 +45,12 @@ disallow_untyped_defs = false
 check_untyped_defs = true
 
 
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
