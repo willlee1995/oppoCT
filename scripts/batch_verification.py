@@ -1,0 +1,840 @@
+"""
+Batch Verification Script
+
+Runs the INTERACTIVE VERIFICATION phase for already-segmented patient cases.
+This script is designed to be run after `batch_segmentation.py` has completed.
+
+Usage:
+    python scripts/batch_verification.py data/processed out/test_batch --output-csv out/results.csv
+"""
+
+print("Initializing Batch Verification Pipeline...", flush=True)
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# Set up logging early to capture imports
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+logger.info("Imports starting...")
+
+# Add project root to sys.path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+import matplotlib
+# Use TkAgg for interactive display
+matplotlib.use('TkAgg')
+
+import matplotlib.pyplot as plt
+import nibabel as nib
+import numpy as np
+import pandas as pd
+from matplotlib.patches import Rectangle, Patch
+from matplotlib.widgets import Button, Slider
+from nibabel.processing import resample_from_to
+
+from src.patient_manager import get_patient_metadata, create_patient_output_dir
+from src.pipeline import find_patient_folders
+from src.visualizer import find_representative_slices
+from verify_segmentation import load_dicom_series, load_segmentation_mask
+
+logger.info("All imports complete.")
+
+# Color map for different vertebrae
+VERTEBRAE_COLORS = {
+    'vertebrae_T11': '#800080',  # Purple
+    'vertebrae_T12': '#FFC0CB',  # Pink
+    'vertebrae_L1': '#FF0000',  # Red
+    'vertebrae_L2': '#FF8C00',  # Dark Orange
+    'vertebrae_L3': '#FFD700',  # Gold
+    'vertebrae_L4': '#00FF00',  # Lime
+    'vertebrae_L5': '#0000FF',  # Blue
+    'vertebrae_T11_body': '#4B0082',  # Indigo
+    'vertebrae_T12_body': '#DB7093',  # Pale Violet Red
+    'vertebrae_L1_body': '#800000',  # Dark Red
+    'vertebrae_L2_body': '#8B4500',  # Saddle Brown
+    'vertebrae_L3_body': '#B8860B',  # Dark Goldenrod
+    'vertebrae_L4_body': '#006400',  # Dark Green
+    'vertebrae_L5_body': '#00008B',  # Dark Blue
+    'vertebrae_L1_body_trabecular_core': '#00FF7F',  # Spring Green
+}
+
+LUMBAR_VERTEBRAE = ['vertebrae_T11', 'vertebrae_T12', 'vertebrae_L1', 'vertebrae_L2', 'vertebrae_L3', 'vertebrae_L4', 'vertebrae_L5']
+LUMBAR_BODIES = [f"{v}_body" for v in LUMBAR_VERTEBRAE]
+
+
+class VerificationViewer:
+    """
+    Interactive viewer for case-by-case verification with sagittal view.
+
+    WARNING: DO NOT CHANGE IMAGE ORIENTATION/DISPLAY LOGIC.
+    The transforms (fliplr, rot90, etc.) in this class are verified and fixed.
+    Modifying them will break the visualization alignment.
+    """
+
+    def __init__(
+        self,
+        ct_volume: np.ndarray,
+        masks: Dict[str, np.ndarray],
+        dicom_folder: Path,
+        patient_id: str,
+        exam_date: Optional[str] = None,
+        window_level: int = 40,
+        window_width: int = 400
+    ):
+        """
+        Initialize the verification viewer.
+
+        Args:
+            ct_volume: 3D CT volume (HU values)
+            masks: Dictionary of vertebra_name -> mask array
+            dicom_folder: Path to DICOM folder for metadata
+            patient_id: Patient identifier
+            exam_date: Exam date from DICOM
+            window_level: Window level for CT display (HU)
+            window_width: Window width for CT display (HU)
+        """
+        self.ct_volume = ct_volume
+        self.masks = masks
+        self.dicom_folder = dicom_folder
+        self.patient_id = patient_id
+        self.exam_date = exam_date
+        self.window_level = window_level
+        self.window_width = window_width
+
+        # Volume dimensions: (height, width, depth) for axial view
+        self.axial_shape = ct_volume.shape  # (H, W, D)
+
+        # Current slice indices
+        self.axial_slice = ct_volume.shape[2] // 2  # Depth axis
+        self.sagittal_slice = ct_volume.shape[1] // 2  # Width axis
+
+        # Selected slices for HU calculation
+        try:
+            self.selected_slices = find_representative_slices(ct_volume, masks, num_slices=3)
+            logger.info(f"Auto-selected slices: {self.selected_slices}")
+        except Exception as e:
+            logger.warning(f"Failed to auto-select slices: {e}")
+            self.selected_slices: List[int] = []
+
+        # Case status
+        self.is_successful: Optional[bool] = None
+
+        # UI elements
+        self.fig = None
+        self.ax_axial = None
+        self.ax_sagittal = None
+        self.slider_axial = None
+        self.slider_sagittal = None
+
+        # Display state
+        self.show_selected = True
+
+        # Label mapping
+        self.label_mapping = {v.replace('vertebrae_', '').replace('_body', ''): v for v in LUMBAR_BODIES}
+        for v in LUMBAR_BODIES:
+            short_name = v.replace('vertebrae_', '').replace('_body', '')
+            if short_name not in self.label_mapping:
+                self.label_mapping[short_name] = v
+
+    def calculate_sagittal_view(self, slice_idx: int) -> np.ndarray:
+        """Extract sagittal slice from CT volume."""
+        if slice_idx < 0 or slice_idx >= self.axial_shape[1]:
+            slice_idx = max(0, min(slice_idx, self.axial_shape[1] - 1))
+        sagittal_slice = self.ct_volume[:, slice_idx, :]
+        return sagittal_slice
+
+    def calculate_volumetric_hu(self, vertebra_name: str) -> float:
+        """Calculate average HU value for the entire volume of a specific vertebra."""
+        mask_name = self.label_mapping.get(vertebra_name, vertebra_name)
+        if not mask_name or mask_name not in self.masks:
+            return 0.0
+
+        mask = self.masks[mask_name]
+        if mask.shape != self.ct_volume.shape:
+            logger.warning(f"Shape mismatch for {mask_name}: {mask.shape} vs {self.ct_volume.shape}")
+            return 0.0
+
+        total_sum = 0.0
+        total_count = 0
+
+        for slice_idx in range(self.axial_shape[2]):
+            ct_slice = self.ct_volume[:, :, slice_idx]
+            ct_slice = np.fliplr(ct_slice)
+
+            mask_slice = mask[:, :, slice_idx]
+            mask_slice = np.rot90(mask_slice, k=-1)
+            mask_slice = np.flipud(mask_slice)
+
+            if np.any(mask_slice > 0):
+                if ct_slice.shape == mask_slice.shape:
+                    masked_hu_values = ct_slice[mask_slice > 0]
+                    total_sum += np.sum(masked_hu_values)
+                    total_count += masked_hu_values.size
+
+        if total_count == 0:
+            return 0.0
+        return float(total_sum / total_count)
+
+    def calculate_average_hu(self, slice_indices: List[int], vertebra_name: Optional[str] = None) -> float:
+        """Calculate average HU value for selected slices."""
+        if not slice_indices:
+            return 0.0
+
+        all_masked_values = []
+        for slice_idx in slice_indices:
+            if 0 <= slice_idx < self.axial_shape[2]:
+                ct_slice = self.ct_volume[:, :, slice_idx]
+                ct_slice = np.fliplr(ct_slice)
+
+                if vertebra_name:
+                    mask_name = self.label_mapping.get(vertebra_name)
+                    if not mask_name or mask_name not in self.masks:
+                        continue
+                    masks_to_use = [self.masks[mask_name]]
+                else:
+                    masks_to_use = self.masks.values()
+
+                combined_mask = np.zeros_like(ct_slice, dtype=bool)
+                for mask in masks_to_use:
+                    if len(mask.shape) == 3 and slice_idx < mask.shape[2]:
+                        mask_slice = mask[:, :, slice_idx]
+                        mask_slice = np.rot90(mask_slice, k=-1)
+                        mask_slice = np.flipud(mask_slice)
+                        combined_mask = combined_mask | (mask_slice > 0)
+
+                if np.any(combined_mask):
+                    masked_hu_values = ct_slice[combined_mask]
+                    all_masked_values.extend(masked_hu_values.tolist())
+
+        if not all_masked_values:
+            return 0.0
+        return float(np.mean(all_masked_values))
+
+    def window_ct(self, ct_slice: np.ndarray) -> np.ndarray:
+        """Apply window/level to CT slice for display."""
+        ct_min = self.window_level - self.window_width / 2
+        ct_max = self.window_level + self.window_width / 2
+        ct_display = np.clip(ct_slice, ct_min, ct_max)
+        if ct_max > ct_min:
+            ct_display = (ct_display - ct_min) / (ct_max - ct_min)
+        else:
+            ct_display = (ct_slice - ct_slice.min()) / (ct_slice.max() - ct_slice.min() + 1e-10)
+        ct_display = np.clip(ct_display, 0.0, 1.0)
+        return ct_display
+
+    def update_axial(self, slice_idx):
+        """Update axial view with segmentation overlays."""
+        slice_idx = int(slice_idx)
+        self.axial_slice = slice_idx
+        self.ax_axial.clear()
+
+        ct_slice = self.ct_volume[:, :, slice_idx]
+        ct_display = self.window_ct(ct_slice)
+        ct_display = np.fliplr(ct_display)
+
+        self.ax_axial.imshow(ct_display, cmap='gray', origin='lower', interpolation='bilinear',
+                            vmin=0.0, vmax=1.0)
+
+        present_vertebrae = []
+        for vertebra_name, mask in self.masks.items():
+            if len(mask.shape) == 3 and slice_idx < mask.shape[2]:
+                mask_slice = mask[:, :, slice_idx]
+            elif len(mask.shape) == 2:
+                mask_slice = mask if mask.shape == ct_slice.shape else np.zeros_like(ct_slice)
+            else:
+                continue
+
+            mask_slice = np.rot90(mask_slice, k=-1)
+            mask_slice = np.flipud(mask_slice)
+
+            if np.any(mask_slice > 0):
+                if vertebra_name == 'vertebrae_body':
+                    color = '#FF00FF'
+                    present_vertebrae.append('All Vertebrae')
+                else:
+                    color = VERTEBRAE_COLORS.get(vertebra_name, '#00FFFF')
+                    present_vertebrae.append(vertebra_name.replace('vertebrae_', ''))
+
+                overlay = np.zeros((*mask_slice.shape, 4))
+                r = int(color[1:3], 16) / 255.0
+                g = int(color[3:5], 16) / 255.0
+                b = int(color[5:7], 16) / 255.0
+                overlay[mask_slice > 0] = [r, g, b, 0.4]
+                self.ax_axial.imshow(overlay, origin='lower', interpolation='nearest')
+                self.ax_axial.contour(mask_slice, levels=[0.5], colors=[color], linewidths=2, alpha=0.8)
+
+        if self.show_selected and slice_idx in self.selected_slices:
+            rect = Rectangle((0, 0), ct_display.shape[1]-1, ct_display.shape[0]-1,
+                           linewidth=3, edgecolor='yellow', facecolor='none')
+            self.ax_axial.add_patch(rect)
+
+        title = f'Axial Slice {slice_idx} / {self.axial_shape[2] - 1}'
+        if present_vertebrae:
+            title += f' - {", ".join(present_vertebrae)}'
+        if slice_idx in self.selected_slices:
+            title += ' [SELECTED]'
+        title_color = 'darkorange' if slice_idx in self.selected_slices else 'black'
+        self.ax_axial.set_title(title, fontsize=14, weight='bold', color=title_color,
+                               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        self.ax_axial.axis('off')
+
+        self.update_sagittal(self.sagittal_slice)
+        self.fig.canvas.draw_idle()
+
+    def update_sagittal(self, slice_idx):
+        """Update sagittal view with segmentation overlays."""
+        slice_idx = int(slice_idx)
+        self.sagittal_slice = slice_idx
+        self.ax_sagittal.clear()
+
+        sagittal_slice = self.calculate_sagittal_view(slice_idx)
+        sagittal_display = self.window_ct(sagittal_slice)
+        sagittal_display = np.rot90(sagittal_display, k=-1)
+
+        self.ax_sagittal.imshow(sagittal_display, cmap='gray', origin='lower', interpolation='bilinear',
+                               aspect='auto', vmin=0.0, vmax=1.0)
+
+        for vertebra_name, mask in self.masks.items():
+            if len(mask.shape) != 3:
+                continue
+            if mask.shape != self.ct_volume.shape:
+                continue
+            if slice_idx < 0 or slice_idx >= mask.shape[0]:
+                continue
+
+            mask_sagittal = mask[slice_idx, :, :]
+            mask_sagittal = np.flipud(mask_sagittal)
+            if mask_sagittal.shape != sagittal_slice.shape:
+                if mask_sagittal.size == sagittal_slice.size:
+                    mask_sagittal = mask_sagittal.reshape(sagittal_slice.shape)
+                else:
+                    continue
+
+            mask_sagittal = np.rot90(mask_sagittal, k=-1)
+
+            if np.any(mask_sagittal > 0):
+                if vertebra_name == 'vertebrae_body':
+                    color = '#FF00FF'
+                else:
+                    color = VERTEBRAE_COLORS.get(vertebra_name, '#00FFFF')
+
+                overlay = np.zeros((*mask_sagittal.shape, 4))
+                r = int(color[1:3], 16) / 255.0
+                g = int(color[3:5], 16) / 255.0
+                b = int(color[5:7], 16) / 255.0
+                overlay[mask_sagittal > 0] = [r, g, b, 0.4]
+                self.ax_sagittal.imshow(overlay, origin='lower', interpolation='nearest', aspect='auto')
+                self.ax_sagittal.contour(mask_sagittal, levels=[0.5], colors=[color], linewidths=2, alpha=0.8)
+
+        if 0 <= self.axial_slice < self.axial_shape[2]:
+            self.ax_sagittal.axhline(y=self.axial_slice, color='cyan', linewidth=3, alpha=0.9, linestyle='--')
+
+        if self.show_selected and self.selected_slices:
+            for sel_slice in self.selected_slices:
+                if 0 <= sel_slice < self.axial_shape[2]:
+                    self.ax_sagittal.axvline(x=sel_slice, color='yellow', linewidth=2, alpha=0.7)
+
+        title = f'Sagittal Slice {slice_idx} / {self.axial_shape[1] - 1}'
+        self.ax_sagittal.set_title(title, fontsize=14, weight='bold', color='black',
+                                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        self.ax_sagittal.axis('off')
+        self.fig.canvas.draw_idle()
+
+    def toggle_slice_selection(self, event):
+        """Toggle selection of current axial slice."""
+        if self.axial_slice in self.selected_slices:
+            self.selected_slices.remove(self.axial_slice)
+        else:
+            self.selected_slices.append(self.axial_slice)
+            self.selected_slices.sort()
+        self.update_axial(self.axial_slice)
+        self.update_sagittal(self.sagittal_slice)
+        self.update_info_text()
+
+    def auto_select_slices(self, event):
+        """Auto-select representative slices."""
+        try:
+            self.selected_slices = find_representative_slices(self.ct_volume, self.masks, num_slices=3)
+            logger.info(f"Auto-selected slices: {self.selected_slices}")
+            self.update_axial(self.axial_slice)
+            self.update_sagittal(self.sagittal_slice)
+            self.update_info_text()
+        except Exception as e:
+            logger.error(f"Error auto-selecting slices: {e}")
+
+    def mark_success(self, event):
+        """Mark case as successful."""
+        self.is_successful = True
+        self.update_info_text()
+
+    def mark_fail(self, event):
+        """Mark case as failed."""
+        self.is_successful = False
+        self.update_info_text()
+
+    def shift_labels_up(self, event):
+        """Shift labels UP (cranial)."""
+        ordered_labels = ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']
+        new_mapping = {}
+        for i, target in enumerate(ordered_labels):
+            if i + 1 < len(ordered_labels):
+                next_default_mask = f"vertebrae_{ordered_labels[i+1]}_body"
+                new_mapping[target] = next_default_mask
+            else:
+                new_mapping[target] = None
+        self.label_mapping.update(new_mapping)
+        self.update_info_text()
+        self.update_mapping_text()
+
+    def shift_labels_down(self, event):
+        """Shift labels DOWN (caudal)."""
+        ordered_labels = ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']
+        new_mapping = {}
+        for i, target in enumerate(ordered_labels):
+            if i - 1 >= 0:
+                prev_default_mask = f"vertebrae_{ordered_labels[i-1]}_body"
+                new_mapping[target] = prev_default_mask
+            else:
+                new_mapping[target] = None
+        self.label_mapping.update(new_mapping)
+        self.update_info_text()
+        self.update_mapping_text()
+
+    def reset_labels(self, event):
+        """Reset labels to default."""
+        self.label_mapping = {v.replace('vertebrae_', '').replace('_body', ''): v for v in LUMBAR_BODIES}
+        self.update_info_text()
+        self.update_mapping_text()
+
+    def update_mapping_text(self):
+        """Update the display of current label mapping."""
+        if hasattr(self, 'txt_mapping'):
+            text = "Label Mapping:\n"
+            ordered_labels = ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']
+            for label in ordered_labels:
+                source = self.label_mapping.get(label)
+                source_name = source.replace('vertebrae_', '').replace('_body', '') if source else "NONE"
+                text += f"{label} <- {source_name}\n"
+            self.txt_mapping.set_text(text)
+            self.fig.canvas.draw_idle()
+
+    def update_info_text(self):
+        """Update information text display."""
+        if hasattr(self, 'info_text'):
+            status = "SUCCESS" if self.is_successful else ("FAILED" if self.is_successful is False else "NOT MARKED")
+            selected_str = ', '.join(map(str, self.selected_slices)) if self.selected_slices else 'None'
+            avg_hu = self.calculate_average_hu(self.selected_slices) if self.selected_slices else 0.0
+
+            l1_body_hu = self.calculate_volumetric_hu('vertebrae_L1_body')
+            l1_core_hu = self.calculate_volumetric_hu('vertebrae_L1_body_trabecular_core')
+
+            info = f"Patient ID: {self.patient_id}\n"
+            info += f"Exam Date: {self.exam_date or 'N/A'}\n"
+            info += f"Status: {status}\n"
+            info += f"Selected Slices: {selected_str}\n"
+            info += f"Average HU: {avg_hu:.1f}\n"
+
+            if l1_body_hu != 0 or l1_core_hu != 0:
+                info += f"L1 Body HU: {l1_body_hu:.1f}\n"
+                info += f"L1 Core HU: {l1_core_hu:.1f}"
+                if l1_core_hu > l1_body_hu and l1_body_hu != 0:
+                     info += f"\nWARNING: Core > Body HU!"
+
+            self.info_text.set_text(info)
+            status_color = 'black'
+            if self.is_successful:
+                status_color = 'darkgreen'
+            elif self.is_successful is False:
+                status_color = 'darkred'
+            if "WARNING" in info and status_color == 'black':
+                 status_color = 'red'
+            self.info_text.set_color(status_color)
+            self.fig.canvas.draw_idle()
+
+    def show(self) -> Dict:
+        """Display the interactive viewer and return results."""
+        current_backend = plt.get_backend()
+        logger.info(f"Current matplotlib backend: {current_backend}")
+
+        self.fig = plt.figure(figsize=(16, 10))
+        self.fig.suptitle(f'Verification: {self.patient_id}', fontsize=18, weight='bold', color='black')
+
+        self.ax_axial = plt.subplot(2, 2, 1)
+        self.ax_sagittal = plt.subplot(2, 2, 2)
+
+        ax_info = plt.subplot(2, 2, 3)
+        ax_info.axis('off')
+        self.info_text = ax_info.text(0.1, 0.5, '', fontsize=13, verticalalignment='center',
+                                      family='monospace', weight='bold', color='black')
+
+        ax_controls = plt.subplot(2, 2, 4)
+        ax_controls.axis('off')
+
+        ax_slider_axial = plt.axes([0.1, 0.08, 0.35, 0.03])
+        ax_slider_sagittal = plt.axes([0.55, 0.08, 0.35, 0.03])
+
+        self.slider_axial = Slider(ax_slider_axial, 'Axial Slice', 0, self.axial_shape[2] - 1,
+                                   valinit=self.axial_slice, valstep=1)
+        self.slider_axial.label.set_fontsize(12)
+        self.slider_axial.label.set_weight('bold')
+        self.slider_axial.on_changed(self.update_axial)
+
+        self.slider_sagittal = Slider(ax_slider_sagittal, 'Sagittal Slice', 0, self.axial_shape[1] - 1,
+                                      valinit=self.sagittal_slice, valstep=1)
+        self.slider_sagittal.label.set_fontsize(12)
+        self.slider_sagittal.label.set_weight('bold')
+        self.slider_sagittal.on_changed(self.update_sagittal)
+
+        btn_y = 0.02
+        btn_height = 0.04
+        btn_width = 0.12
+
+        btn_success = Button(plt.axes([0.1, btn_y, btn_width, btn_height]), 'Mark Success')
+        btn_success.label.set_fontsize(11)
+        btn_success.label.set_weight('bold')
+        btn_success.on_clicked(self.mark_success)
+
+        btn_fail = Button(plt.axes([0.23, btn_y, btn_width, btn_height]), 'Mark Fail')
+        btn_fail.label.set_fontsize(11)
+        btn_fail.label.set_weight('bold')
+        btn_fail.on_clicked(self.mark_fail)
+
+        btn_select_slice = Button(plt.axes([0.36, btn_y, btn_width, btn_height]), 'Toggle Slice')
+        btn_select_slice.label.set_fontsize(11)
+        btn_select_slice.label.set_weight('bold')
+        btn_select_slice.on_clicked(self.toggle_slice_selection)
+
+        btn_auto_select = Button(plt.axes([0.49, btn_y, btn_width, btn_height]), 'Auto Select')
+        btn_auto_select.label.set_fontsize(11)
+        btn_auto_select.label.set_weight('bold')
+        btn_auto_select.on_clicked(self.auto_select_slices)
+
+        btn_done = Button(plt.axes([0.62, btn_y, btn_width * 1.2, btn_height]), 'Done (Save & Next)')
+        btn_done.label.set_fontsize(11)
+        btn_done.label.set_weight('bold')
+        btn_done.on_clicked(lambda x: plt.close(self.fig))
+
+        ax_controls_labels = plt.axes([0.75, 0.25, 0.15, 0.2])
+        ax_controls_labels.axis('off')
+        self.txt_mapping = ax_controls_labels.text(0, 1, "", fontsize=10, verticalalignment='top', family='monospace')
+        self.update_mapping_text()
+
+        btn_shift_up = Button(plt.axes([0.75, 0.20, 0.15, 0.04]), 'Shift Up (L1<-L2)')
+        btn_shift_up.on_clicked(self.shift_labels_up)
+
+        btn_shift_down = Button(plt.axes([0.75, 0.15, 0.15, 0.04]), 'Shift Down (L2<-L1)')
+        btn_shift_down.on_clicked(self.shift_labels_down)
+
+        btn_reset = Button(plt.axes([0.75, 0.10, 0.15, 0.04]), 'Reset Labels')
+        btn_reset.on_clicked(self.reset_labels)
+
+        instructions = (
+            "Instructions:\n"
+            "1. Navigate slices using sliders\n"
+            "2. Click 'Toggle Slice' to select/deselect current axial slice\n"
+            "3. Mark case as Success or Fail\n"
+            "4. Click 'Done' to save and proceed to next case"
+        )
+        ax_controls.text(0.05, 0.7, instructions, fontsize=12, verticalalignment='top',
+                         family='monospace', transform=ax_controls.transAxes,
+                         weight='bold', color='black')
+
+        legend_elements = []
+        for name, mask in self.masks.items():
+            if name == 'vertebrae_body':
+                legend_elements.append(Patch(facecolor='#FF00FF', alpha=0.5, label='All Vertebrae (combined)'))
+            elif name in VERTEBRAE_COLORS:
+                color = VERTEBRAE_COLORS[name]
+                legend_elements.append(Patch(facecolor=color, alpha=0.5, label=name.replace('vertebrae_', '')))
+
+        if legend_elements:
+            self.ax_axial.legend(handles=legend_elements, loc='upper right', framealpha=0.9, fontsize=11,
+                                edgecolor='black', facecolor='white')
+
+        self.update_axial(self.axial_slice)
+        self.update_sagittal(self.sagittal_slice)
+        self.update_info_text()
+
+        logger.info("Displaying interactive window...")
+        plt.show(block=True)
+
+        if self.fig:
+            plt.close(self.fig)
+
+        return {
+            'patient_id': self.patient_id,
+            'exam_date': self.exam_date,
+            'is_successful': self.is_successful,
+            'selected_slices': self.selected_slices.copy(),
+            'average_hu': self.calculate_average_hu(self.selected_slices),
+            'label_mapping': self.label_mapping.copy(),
+            'vertebra_hu': {
+                label: self.calculate_volumetric_hu(label)
+                for label in ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']
+            },
+            'l1_trabecular_core_hu': self.calculate_volumetric_hu('vertebrae_L1_body_trabecular_core')
+        }
+
+
+def check_segmentations_exist(segmentation_dir: Path) -> bool:
+    """Check if segmentation files already exist in the directory."""
+    if not segmentation_dir.exists():
+        return False
+
+    vertebrae_body_path = segmentation_dir / "vertebrae_body.nii.gz"
+    if vertebrae_body_path.exists():
+        return True
+
+    for vertebra in LUMBAR_VERTEBRAE:
+        mask_path = segmentation_dir / f"{vertebra}.nii.gz"
+        if mask_path.exists():
+            return True
+        body_path = segmentation_dir / f"{vertebra}_body.nii.gz"
+        if body_path.exists():
+            return True
+
+    return False
+
+
+def load_masks_for_verification(segmentation_dir: Path, ct_img: nib.Nifti1Image) -> Dict[str, np.ndarray]:
+    """Load segmentation masks and resample them to match CT volume space."""
+    masks = {}
+    ct_shape = ct_img.shape[:3]
+
+    for vertebra in LUMBAR_BODIES:
+        mask_path = segmentation_dir / f"{vertebra}.nii.gz"
+        if mask_path.exists():
+            try:
+                mask_img = load_segmentation_mask(mask_path)
+                mask_shape = mask_img.shape[:3]
+
+                if mask_shape != ct_shape:
+                    logger.info(f"Resampling {vertebra} mask from {mask_shape} to {ct_shape}")
+                    resampled_mask_img = resample_from_to(mask_img, ct_img, order=0)
+                    mask_data = resampled_mask_img.get_fdata()
+                else:
+                    mask_data = mask_img.get_fdata()
+
+                masks[vertebra] = mask_data
+            except Exception as e:
+                logger.warning(f"Failed to load mask {mask_path}: {e}")
+
+    core_name = 'vertebrae_L1_body_trabecular_core'
+    core_mask_path = segmentation_dir / f"{core_name}.nii.gz"
+    if core_mask_path.exists():
+        try:
+            mask_img = load_segmentation_mask(core_mask_path)
+            mask_shape = mask_img.shape[:3]
+            if mask_shape != ct_shape:
+                resampled_mask_img = resample_from_to(mask_img, ct_img, order=0)
+                mask_data = resampled_mask_img.get_fdata()
+            else:
+                mask_data = mask_img.get_fdata()
+            masks[core_name] = mask_data
+        except Exception as e:
+            logger.warning(f"Failed to load core mask {core_mask_path}: {e}")
+
+    if not masks:
+        vertebrae_body_path = segmentation_dir / "vertebrae_body.nii.gz"
+        if vertebrae_body_path.exists():
+            try:
+                mask_img = load_segmentation_mask(vertebrae_body_path)
+                mask_shape = mask_img.shape[:3]
+                if mask_shape != ct_shape:
+                    resampled_mask_img = resample_from_to(mask_img, ct_img, order=0)
+                    mask_data = resampled_mask_img.get_fdata()
+                else:
+                    mask_data = mask_img.get_fdata()
+                masks['vertebrae_body'] = mask_data
+            except Exception as e:
+                logger.warning(f"Failed to load vertebrae_body mask: {e}")
+
+    return masks
+
+
+def load_ct_for_verification(dicom_folder: Path, segmentation_dir: Path) -> Tuple[np.ndarray, nib.Nifti1Image]:
+    """Load CT volume for verification."""
+    logger.info("Loading CT from DICOM series...")
+    ct_img = load_dicom_series(dicom_folder)
+    ct_volume = ct_img.get_fdata()
+    logger.info(f"Loaded CT volume with shape: {ct_volume.shape}")
+    return ct_volume, ct_img
+
+
+def save_verification_results(results: List[Dict], output_csv: Path):
+    """Save verification results to CSV."""
+    csv_data = []
+
+    for result in results:
+        patient_id = result.get('patient_id', 'UNKNOWN')
+        exam_date = result.get('exam_date', '')
+        is_successful = result.get('is_successful')
+        selected_slices = result.get('selected_slices', [])
+        average_hu = result.get('average_hu')
+        l1_core_hu = result.get('l1_trabecular_core_hu')
+
+        slice_numbers = ','.join(map(str, selected_slices)) if selected_slices else ''
+
+        csv_data.append({
+            'Exam Date': exam_date,
+            'Patient ID': patient_id,
+            'Status': 'Success' if is_successful else ('Failed' if is_successful is False else 'Not Marked'),
+            'Selected Slice Numbers': slice_numbers,
+            'Average HU (All)': f"{average_hu:.2f}" if average_hu is not None else '',
+            'L1 Trabecular Core HU': f"{l1_core_hu:.2f}" if l1_core_hu is not None and l1_core_hu != 0 else '',
+            **{f"{v} HU": f"{result.get('vertebra_hu', {}).get(v, 0.0):.2f}" for v in ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']},
+            **{f"{v} Source": result.get('label_mapping', {}).get(v, '') for v in ['T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5']}
+        })
+
+    df = pd.DataFrame(csv_data)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output_csv, index=False)
+    logger.info(f"Saved {len(csv_data)} verification results to {output_csv}")
+
+
+def run_batch_verification(
+    input_path: Path,
+    output_base_dir: Path,
+    output_csv: Path,
+    window_level: int = 40,
+    window_width: int = 400
+):
+    """
+    Run the batch verification pipeline (Phase 2 only).
+
+    Iterates over patient folders on disk and verifies segmentations interactively.
+    """
+    patient_folders = find_patient_folders(input_path)
+    if not patient_folders:
+        raise ValueError(f"No patient folders found in {input_path}")
+
+    logger.info(f"Found {len(patient_folders)} patient folder(s)")
+    output_base_dir = Path(output_base_dir)
+
+    # Find cases that have segmentations
+    cases_to_verify = []
+    for patient_folder in patient_folders:
+        try:
+            metadata = get_patient_metadata(patient_folder)
+            patient_id = metadata['patient_id'] or patient_folder.name
+            exam_date = metadata['study_date']
+            study_folder_name = patient_folder.name
+
+            patient_output_dir = create_patient_output_dir(output_base_dir, patient_id, study_id=study_folder_name)
+            segmentation_dir = patient_output_dir / 'segmentations'
+
+            if check_segmentations_exist(segmentation_dir):
+                cases_to_verify.append({
+                    'dicom_folder': patient_folder,
+                    'segmentation_dir': segmentation_dir,
+                    'patient_id': patient_id,
+                    'exam_date': exam_date
+                })
+            else:
+                logger.warning(f"No segmentations found for {patient_id} at {segmentation_dir}, skipping.")
+        except Exception as e:
+            logger.error(f"Error processing {patient_folder}: {e}")
+
+    logger.info(f"Found {len(cases_to_verify)} cases with segmentations to verify")
+
+    if not cases_to_verify:
+        logger.error("No cases found with segmentations. Run batch_segmentation.py first.")
+        return
+
+    logger.info("\n=== STARTING INTERACTIVE VERIFICATION ===")
+    all_results = []
+
+    for i, case_data in enumerate(cases_to_verify, 1):
+        dicom_folder = case_data['dicom_folder']
+        segmentation_dir = case_data['segmentation_dir']
+        patient_id = case_data['patient_id']
+        exam_date = case_data['exam_date']
+
+        logger.info(f"\nVerifying case {i}/{len(cases_to_verify)}: {patient_id}")
+
+        try:
+            ct_volume, ct_img = load_ct_for_verification(dicom_folder, segmentation_dir)
+            masks = load_masks_for_verification(segmentation_dir, ct_img)
+
+            if not masks:
+                logger.warning(f"No segmentation masks found for {patient_id}")
+
+            logger.info("Opening viewer...")
+
+            viewer = VerificationViewer(
+                ct_volume=ct_volume,
+                masks=masks,
+                dicom_folder=dicom_folder,
+                patient_id=patient_id,
+                exam_date=exam_date,
+                window_level=window_level,
+                window_width=window_width
+            )
+
+            result = viewer.show()
+            all_results.append(result)
+
+            logger.info("Case verified successfully")
+
+        except Exception as e:
+            logger.error(f"Error verifying {patient_id}: {e}", exc_info=True)
+            all_results.append({
+                'patient_id': patient_id,
+                'exam_date': exam_date,
+                'is_successful': None,
+                'selected_slices': [],
+                'average_hu': None,
+                'error': str(e)
+            })
+
+    logger.info("\n=== SAVING RESULTS ===")
+    save_verification_results(all_results, output_csv)
+    logger.info(f"Done. Results in {output_csv}")
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description='Batch verification pipeline: Verify already-segmented patients interactively',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument('input_path', type=Path, help='Input directory containing patient DICOM folders')
+    parser.add_argument('output_dir', type=Path, help='Output directory where segmentations are saved')
+
+    parser.add_argument('--output-csv', type=Path, default=None, help='Output CSV file path')
+    parser.add_argument('--window-level', type=int, default=40, help='Window level')
+    parser.add_argument('--window-width', type=int, default=400, help='Window width')
+
+    args = parser.parse_args()
+
+    if not args.input_path.exists():
+        logger.error(f"Input directory does not exist: {args.input_path}")
+        sys.exit(1)
+
+    if args.output_csv is None:
+        args.output_csv = args.output_dir / 'batch_results.csv'
+
+    try:
+        run_batch_verification(
+            input_path=args.input_path,
+            output_base_dir=args.output_dir,
+            output_csv=args.output_csv,
+            window_level=args.window_level,
+            window_width=args.window_width
+        )
+    except KeyboardInterrupt:
+        logger.info("\nBatch verification interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

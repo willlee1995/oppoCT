@@ -40,7 +40,7 @@ pip install uv
 2. Create a virtual environment and install dependencies:
 ```bash
 uv venv
-source .venv/bin/activate  
+source .venv/bin/activate
 .venv\Scripts\activate # Windows
 uv pip install -r requirements.txt
 ```
@@ -103,6 +103,31 @@ python run_pipeline.py ./data/patients ./output --fast
 ```bash
 python run_pipeline.py ./data/patients ./output --verbose
 ```
+
+### Batch Segmentation and Verification (Overnight Workflow)
+
+For processing large datasets, you can separate the segmentation (GPU-intensive, unattended) from the verification (interactive):
+
+**Step 1: Run segmentation overnight**
+```bash
+python scripts/batch_segmentation.py ./data/patients ./output --device gpu
+```
+This script:
+- Shows a Tkinter progress window
+- Processes all patients and generates segmentation masks
+- Can run unattended (no user interaction required)
+- Skips already-processed cases
+
+**Step 2: Verify results interactively**
+```bash
+python scripts/batch_verification.py ./data/patients ./output --output-csv ./results.csv
+```
+This script:
+- Opens an interactive viewer for each case
+- Shows axial and sagittal views with mask overlays
+- Allows marking cases as Success/Fail
+- Exports verification results to CSV
+
 
 ## Input Format
 
@@ -247,10 +272,10 @@ If `torch.cuda.is_available()` returns `False` even though `nvidia-smi` works:
    ```bash
    # For CUDA 11.8 (most common)
    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-   
+
    # For CUDA 12.1
    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-   
+
    # For CUDA 12.4
    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
    ```
