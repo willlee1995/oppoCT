@@ -27,7 +27,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import matplotlib
 # Use TkAgg for interactive display
-matplotlib.use('TkAgg')
+matplotlib.use("TkAgg", force=True)
 
 import matplotlib.pyplot as plt
 import nibabel as nib
@@ -37,6 +37,7 @@ from matplotlib.patches import Rectangle, Patch
 from matplotlib.widgets import Button, Slider
 from nibabel.processing import resample_from_to
 
+from src.dicom_processor import dicom_to_nifti
 from src.patient_manager import get_patient_metadata, create_patient_output_dir
 from src.pipeline import find_patient_folders
 from src.visualizer import find_representative_slices
@@ -456,10 +457,40 @@ class VerificationViewer:
             self.info_text.set_color(status_color)
             self.fig.canvas.draw_idle()
 
-    def show(self) -> Dict:
-        """Display the interactive viewer and return results."""
+    def show(self, tk_root=None) -> Dict:
+        """Display the interactive viewer and return results.
+
+        When ``tk_root`` is the running Tkinter root (e.g. batch GUI), use a
+        non-blocking show plus a cooperative event loop so the figure window
+        actually appears while the main app is already in ``mainloop()``.
+        Calling ``plt.show(block=True)`` from a Tk button handler often yields
+        no visible window or an immediate return on some setups.
+        """
         current_backend = plt.get_backend()
         logger.info(f"Current matplotlib backend: {current_backend}")
+
+        if current_backend.lower() == "agg":
+            try:
+                import tkinter  # noqa: F401
+
+                logger.info("tkinter is available, attempting to switch to TkAgg backend...")
+                matplotlib.use("TkAgg", force=True)
+                plt.close("all")
+                current_backend = plt.get_backend()
+                logger.info(f"Backend after switch: {current_backend}")
+            except ImportError:
+                logger.error("tkinter is not available. Cannot use TkAgg backend.")
+                raise RuntimeError(
+                    "No interactive matplotlib backend available. Install tkinter or PyQt5."
+                ) from None
+
+        if current_backend.lower() == "agg":
+            logger.error("Matplotlib backend is still 'Agg' after attempting to switch.")
+            raise RuntimeError(
+                "Cannot use interactive matplotlib backend. Backend is locked to 'Agg'."
+            )
+
+        logger.info(f"Using backend: {current_backend} for interactive display")
 
         self.fig = plt.figure(figsize=(16, 10))
         self.fig.suptitle(f'Verification: {self.patient_id}', fontsize=18, weight='bold', color='black')
@@ -561,7 +592,33 @@ class VerificationViewer:
         self.update_info_text()
 
         logger.info("Displaying interactive window...")
-        plt.show(block=True)
+        if tk_root is not None:
+            plt.show(block=False)
+            try:
+                mgr_win = self.fig.canvas.manager.window
+                mgr_win.lift()
+                try:
+                    mgr_win.attributes("-topmost", True)
+                    mgr_win.attributes("-topmost", False)
+                except Exception:
+                    pass
+                mgr_win.focus_force()
+            except Exception:
+                logger.debug("Could not lift matplotlib viewer window", exc_info=True)
+
+            try:
+                while plt.fignum_exists(self.fig.number):
+                    tk_root.update()
+                    tk_root.update_idletasks()
+                    try:
+                        self.fig.canvas.flush_events()
+                    except Exception:
+                        break
+                    plt.pause(0.02)
+            except Exception:
+                logger.debug("Viewer event loop ended with exception", exc_info=True)
+        else:
+            plt.show(block=True)
 
         if self.fig:
             plt.close(self.fig)
@@ -657,10 +714,21 @@ def load_masks_for_verification(segmentation_dir: Path, ct_img: nib.Nifti1Image)
     return masks
 
 
-def load_ct_for_verification(dicom_folder: Path, segmentation_dir: Path) -> Tuple[np.ndarray, nib.Nifti1Image]:
+def load_ct_for_verification(
+    dicom_folder: Path,
+    segmentation_dir: Path,
+    series_instance_uid: Optional[str] = None,
+) -> Tuple[np.ndarray, nib.Nifti1Image]:
     """Load CT volume for verification."""
-    logger.info("Loading CT from DICOM series...")
-    ct_img = load_dicom_series(dicom_folder)
+    suid = (series_instance_uid or "").strip()
+    if suid:
+        logger.info("Loading CT from DICOM (series %s)...", suid[:20] + ("…" if len(suid) > 20 else ""))
+        ct_img, _ = dicom_to_nifti(
+            dicom_folder, output_path=None, series_instance_uid=suid
+        )
+    else:
+        logger.info("Loading CT from DICOM series...")
+        ct_img = load_dicom_series(dicom_folder)
     ct_volume = ct_img.get_fdata()
     logger.info(f"Loaded CT volume with shape: {ct_volume.shape}")
     return ct_volume, ct_img

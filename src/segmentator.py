@@ -13,6 +13,11 @@ import nibabel as nib
 import numpy as np
 from scipy import ndimage
 
+from .totalseg_local_weights import (
+    enforce_local_weights_if_configured,
+    skip_vertebrae_body_seg,
+)
+
 try:
     from totalsegmentator.python_api import totalsegmentator
 except ImportError:
@@ -129,10 +134,9 @@ def segment_lumbar_vertebrae(
     # Determine if preview can be enabled (Linux/WSL supports it, Windows native doesn't)
     enable_preview = platform.system() != 'Windows'
 
-    try:
-        if verbose:
-            logging.info("Segmenting vertebrae_body using TotalSegmentator...")
+    enforce_local_weights_if_configured(fast=fast, verbose=verbose)
 
+    try:
         # Use DICOM directory directly if requested (matches CLI behavior)
         if use_dicom_directly and dicom_dir:
             input_path = str(dicom_dir)
@@ -141,31 +145,41 @@ def segment_lumbar_vertebrae(
         else:
             input_path = str(nifti_path)
 
-        # 1. Run vertebrae_body task to get the body masks (unlabeled levels)
-        # This will produce 'vertebrae_body.nii.gz'
-        # IMPORTANT: When ml=True, output must be a file path, not a directory
         body_mask_path = output_dir / "vertebrae_body.nii.gz"
-        try:
-            totalsegmentator(
-                input=input_path,
-                output=str(body_mask_path),
-                task="vertebrae_body",
-                fast=False,  # vertebrae_body task does not support fast mode
-                device=device,
-                verbose=verbose,
-                preview=enable_preview,
-                ml=True  # Save as multilabel to get a single file (merged or single class)
-            )
-        except SystemExit:
-            logging.warning("TotalSegmentator 'vertebrae_body' task failed (likely due to missing license).")
-            logging.warning("Proceeding without separate body masks (trabecular core analysis may be skipped).")
-            # Ensure we don't leave a partial file
-            if body_mask_path.exists():
-                # check if it's empty or valid?
-                pass
-        except Exception as e:
-            logging.warning(f"TotalSegmentator 'vertebrae_body' task failed: {e}")
-            logging.warning("Proceeding without separate body masks.")
+        if skip_vertebrae_body_seg():
+            if verbose:
+                logging.info(
+                    "Skipping vertebrae_body (OPPOCT_SKIP_VERTEBRAE_BODY_SEG); "
+                    "labeled body intersections may be incomplete."
+                )
+        else:
+            if verbose:
+                logging.info("Segmenting vertebrae_body using TotalSegmentator...")
+
+            # 1. Run vertebrae_body task to get the body masks (unlabeled levels)
+            # This will produce 'vertebrae_body.nii.gz'
+            # IMPORTANT: When ml=True, output must be a file path, not a directory
+            try:
+                totalsegmentator(
+                    input=input_path,
+                    output=str(body_mask_path),
+                    task="vertebrae_body",
+                    fast=False,  # vertebrae_body task does not support fast mode
+                    device=device,
+                    verbose=verbose,
+                    preview=enable_preview,
+                    ml=True  # Save as multilabel to get a single file (merged or single class)
+                )
+            except SystemExit:
+                logging.warning("TotalSegmentator 'vertebrae_body' task failed (likely due to missing license).")
+                logging.warning("Proceeding without separate body masks (trabecular core analysis may be skipped).")
+                # Ensure we don't leave a partial file
+                if body_mask_path.exists():
+                    # check if it's empty or valid?
+                    pass
+            except Exception as e:
+                logging.warning(f"TotalSegmentator 'vertebrae_body' task failed: {e}")
+                logging.warning("Proceeding without separate body masks.")
 
         # 2. Run total task with ROI subset to get labeled whole vertebrae (L1-L5)
         # This will produce 'vertebrae_L1.nii.gz', 'vertebrae_L2.nii.gz', etc.

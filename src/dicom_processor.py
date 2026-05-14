@@ -4,41 +4,141 @@ DICOM Processing Module
 Converts DICOM series to NIfTI format and extracts patient identifiers.
 """
 
+import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import nibabel as nib
 import numpy as np
 import pydicom
+from pydicom.tag import Tag
 
 from .patient_manager import get_patient_metadata, normalize_patient_id
 
+# Series / study identifiers only — avoids parsing large sequences or unrelated groups.
+_SERIES_HEADER_TAGS: Tuple[Tag, ...] = (
+    Tag(0x0008, 0x0060),  # Modality
+    Tag(0x0020, 0x000E),  # SeriesInstanceUID
+    Tag(0x0008, 0x103E),  # SeriesDescription
+    Tag(0x0020, 0x000D),  # StudyInstanceUID
+)
 
-def load_dicom_series(dicom_folder: Path) -> Tuple[np.ndarray, dict]:
+
+def _read_dicom_series_header_tags(fp: Path):
+    """
+    Load only tags needed to group instances by series. Falls back to a full meta read
+    if a selective read fails (some encoders dislike ``specific_tags``).
+    """
+    try:
+        return pydicom.dcmread(
+            str(fp),
+            stop_before_pixels=True,
+            specific_tags=list(_SERIES_HEADER_TAGS),
+        )
+    except Exception:
+        try:
+            return pydicom.dcmread(str(fp), stop_before_pixels=True)
+        except Exception:
+            return None
+
+
+def iter_dicom_file_paths(dicom_folder: Path) -> List[Path]:
+    """Return sorted unique paths to DICOM instances under ``dicom_folder`` (root + recursive)."""
+    paths = list(iter_dicom_file_paths_streaming(dicom_folder))
+    return sorted(set(paths))
+
+
+def iter_dicom_file_paths_streaming(dicom_folder: Path) -> Iterator[Path]:
+    """Yield paths to DICOM instances (``os.walk``); avoids building a full path list before reads."""
+    if not dicom_folder.is_dir():
+        return
+    for root, _dirs, files in os.walk(dicom_folder):
+        root_path = Path(root)
+        for name in files:
+            lower = name.lower()
+            if lower.endswith(".dcm") or lower.endswith(".dicom"):
+                yield root_path / name
+
+
+def single_ct_series_fields_if_unique(dicom_folder: Path) -> Optional[Tuple[str, str]]:
+    """
+    If ``dicom_folder`` contains exactly one CT series (by SeriesInstanceUID), return
+    ``(series_instance_uid, series_description)`` from a CT instance.
+
+    Stops reading files as soon as two distinct CT series UIDs are seen (cannot autofill).
+    """
+    if not dicom_folder.is_dir():
+        return None
+    ct_uid_to_desc: Dict[str, str] = {}
+    for fp in iter_dicom_file_paths_streaming(dicom_folder):
+        ds = _read_dicom_series_header_tags(fp)
+        if ds is None:
+            continue
+        mod = str(getattr(ds, "Modality", "") or "").strip().upper()
+        if mod != "CT":
+            continue
+        uid = str(getattr(ds, "SeriesInstanceUID", "") or "").strip()
+        if uid in ct_uid_to_desc:
+            # Same series as already seen — no effect on single-CT autofill.
+            continue
+        desc = str(getattr(ds, "SeriesDescription", "") or "").strip()
+        if len(ct_uid_to_desc) >= 1:
+            return None
+        ct_uid_to_desc[uid] = desc
+    if len(ct_uid_to_desc) == 1:
+        uid, desc = next(iter(ct_uid_to_desc.items()))
+        return uid, desc
+    return None
+
+
+def enumerate_dicom_series(dicom_folder: Path) -> List[Dict[str, object]]:
+    """
+    Group DICOM instances under ``dicom_folder`` by SeriesInstanceUID.
+
+    Returns one row per series with human-readable fields for UI / CSV.
+    Files without SeriesInstanceUID are grouped under an empty UID string.
+    """
+    by_uid: Dict[str, Dict[str, object]] = {}
+    for fp in iter_dicom_file_paths_streaming(dicom_folder):
+        ds = _read_dicom_series_header_tags(fp)
+        if ds is None:
+            continue
+        uid = str(getattr(ds, "SeriesInstanceUID", "") or "").strip()
+        if uid in by_uid:
+            by_uid[uid]["num_instances"] = int(by_uid[uid]["num_instances"]) + 1
+            continue
+        by_uid[uid] = {
+            "series_instance_uid": uid,
+            "series_description": str(getattr(ds, "SeriesDescription", "") or "").strip(),
+            "modality": str(getattr(ds, "Modality", "") or "").strip(),
+            "num_instances": 1,
+            "study_instance_uid": str(getattr(ds, "StudyInstanceUID", "") or "").strip(),
+        }
+
+    rows: List[Dict[str, object]] = []
+    for uid in sorted(by_uid.keys(), key=lambda x: (x == "", x)):
+        rows.append(by_uid[uid])
+    return rows
+
+
+def load_dicom_series(
+    dicom_folder: Path, series_instance_uid: Optional[str] = None
+) -> Tuple[np.ndarray, dict]:
     """
     Load DICOM series from folder and convert to numpy array.
     
     Args:
         dicom_folder: Path to folder containing DICOM files
+        series_instance_uid: If set, only instances with this SeriesInstanceUID are loaded.
+            None or empty string keeps the legacy behavior (all instances in the tree).
         
     Returns:
         Tuple of (image_array, metadata_dict)
         - image_array: 3D numpy array of CT image
         - metadata_dict: Dictionary with spacing, origin, direction, etc.
     """
-    # Find all DICOM files
-    dicom_files = []
-    
-    # Check root directory
-    dicom_files.extend(dicom_folder.glob('*.dcm'))
-    dicom_files.extend(dicom_folder.glob('*.DCM'))
-    
-    # Check subdirectories recursively
-    for subdir in dicom_folder.rglob('*'):
-        if subdir.is_file():
-            if subdir.suffix.lower() in ['.dcm', '.dicom']:
-                dicom_files.append(subdir)
-    
+    dicom_files = iter_dicom_file_paths(dicom_folder)
+
     if not dicom_files:
         raise ValueError(f"No DICOM files found in {dicom_folder}")
     
@@ -54,7 +154,20 @@ def load_dicom_series(dicom_folder: Path) -> Tuple[np.ndarray, dict]:
     
     if not slices:
         raise ValueError(f"No valid DICOM files found in {dicom_folder}")
-    
+
+    filter_uid = (series_instance_uid or "").strip()
+    if filter_uid:
+        filtered = []
+        for ds in slices:
+            suid = str(getattr(ds, "SeriesInstanceUID", "") or "").strip()
+            if suid == filter_uid:
+                filtered.append(ds)
+        if not filtered:
+            raise ValueError(
+                f"No slices with SeriesInstanceUID={filter_uid!r} under {dicom_folder}"
+            )
+        slices = filtered
+
     # Sort slices by ImagePositionPatient[2] (z-coordinate) or SliceLocation
     try:
         slices.sort(key=lambda x: float(x.ImagePositionPatient[2]) if hasattr(x, 'ImagePositionPatient') and x.ImagePositionPatient else 
@@ -107,19 +220,24 @@ def load_dicom_series(dicom_folder: Path) -> Tuple[np.ndarray, dict]:
     return volume, metadata
 
 
-def dicom_to_nifti(dicom_folder: Path, output_path: Optional[Path] = None) -> Tuple[nib.Nifti1Image, str]:
+def dicom_to_nifti(
+    dicom_folder: Path,
+    output_path: Optional[Path] = None,
+    series_instance_uid: Optional[str] = None,
+) -> Tuple[nib.Nifti1Image, str]:
     """
     Convert DICOM series to NIfTI format.
     
     Args:
         dicom_folder: Path to folder containing DICOM files
         output_path: Optional path to save NIfTI file. If None, returns image object only.
+        series_instance_uid: Optional SeriesInstanceUID to restrict which instances are stacked.
         
     Returns:
         Tuple of (nifti_image, patient_id)
     """
     # Load DICOM series
-    volume, metadata = load_dicom_series(dicom_folder)
+    volume, metadata = load_dicom_series(dicom_folder, series_instance_uid=series_instance_uid)
     
     # Extract patient ID
     patient_metadata = get_patient_metadata(dicom_folder)

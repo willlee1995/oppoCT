@@ -128,6 +128,34 @@ This script:
 - Allows marking cases as Success/Fail
 - Exports verification results to CSV
 
+### CSV-Driven Batch Verification GUI
+
+For large batches that need resumable tracking, launch the Tkinter workflow:
+```bash
+python run_batch_gui.py
+```
+
+The GUI has three steps:
+- **Create CSV List**: scan a top-level DICOM folder and save one row per case.
+- **Segment In Batch**: process `pending` rows and update the same CSV after each case.
+- **Verify And Mark CSV**: open the existing verification viewer, then write `success`, `failed`, or `not applicable` back to the CSV.
+
+This GUI is an orchestration layer only. It reuses the existing segmentation pipeline and the existing verification viewer, so TotalSegmentator calls and display orientation transforms are not changed.
+
+### PyInstaller Batch GUI Build
+
+For a portable Windows onedir package, download the model weights before building:
+```bash
+python download_weights_lumbar.py --weights-dir totalsegmentator_weights --device cpu
+```
+
+Then build the batch GUI package:
+```bash
+pyinstaller build_windows_batch_gui.spec -y
+```
+
+The output is written to `dist/oppoCT-Batch-QC-Package/` with `oppoCT-Batch-QC.exe`. The launcher configures `TOTALSEG_WEIGHTS_PATH` before importing the segmentation stack, and the spec bundles `totalsegmentator_weights/` when that folder exists at build time.
+
 
 ## Input Format
 

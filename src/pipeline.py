@@ -34,7 +34,8 @@ def process_single_patient(
     fast_segmentation: bool = False,
     device: str = 'gpu',
     keep_temp_files: bool = False,
-    forced_study_id: Optional[str] = None
+    forced_study_id: Optional[str] = None,
+    series_instance_uid: Optional[str] = None,
 ) -> Dict:
     """
     Process a single patient through the entire pipeline.
@@ -47,6 +48,8 @@ def process_single_patient(
         device: Device for segmentation ('gpu' or 'cpu')
         keep_temp_files: Keep temporary NIfTI files
         forced_study_id: Optional forced study ID (e.g., with suffix) to use for output folder
+        series_instance_uid: If set, only this DICOM series is converted and passed to segmentation
+            (TotalSegmentator runs on the derived NIfTI for reproducible alignment).
         
     Returns:
         Dictionary with patient_id and processing status/results
@@ -61,6 +64,8 @@ def process_single_patient(
     }
     
     try:
+        series_filter = (series_instance_uid or "").strip() or None
+
         # Step 1: Extract patient ID
         logging.info(f"Processing patient from {dicom_folder}")
         patient_id = extract_patient_id(dicom_folder)
@@ -80,7 +85,9 @@ def process_single_patient(
         temp_nifti_path = temp_dir / f"{patient_id}_temp.nii.gz"
         logging.info(f"Converting DICOM to NIfTI: {temp_nifti_path}")
         
-        nifti_img, extracted_pid = dicom_to_nifti(dicom_folder, temp_nifti_path)
+        nifti_img, extracted_pid = dicom_to_nifti(
+            dicom_folder, temp_nifti_path, series_instance_uid=series_filter
+        )
         if extracted_pid != patient_id:
             logging.warning(f"Patient ID mismatch: extracted {extracted_pid}, using {patient_id}")
         
@@ -96,14 +103,16 @@ def process_single_patient(
         # The NIfTI conversion above is kept for statistics and visualization reference,
         # and we've ensured it uses canonical orientation to match TotalSegmentator's output.
         logging.info("Segmenting lumbar vertebrae...")
+        # When a series UID is fixed, segment from the converted NIfTI so the stack matches QC.
+        use_dicom_directly = series_filter is None
         segment_lumbar_vertebrae(
             nifti_path=temp_nifti_path,
             output_dir=segmentations_dir,
             fast=fast_segmentation,
             device=device,
             verbose=True,
-            use_dicom_directly=True,
-            dicom_dir=dicom_folder
+            use_dicom_directly=use_dicom_directly,
+            dicom_dir=dicom_folder if use_dicom_directly else None,
         )
         
         # Verify segmentation output
