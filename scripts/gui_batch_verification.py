@@ -18,6 +18,7 @@ import matplotlib
 matplotlib.use("TkAgg", force=True)
 
 import csv
+import json
 import logging
 import re
 import sys
@@ -43,10 +44,7 @@ from batch_verification import (  # noqa: E402
     load_ct_for_verification,
     load_masks_for_verification,
 )
-from src.dicom_processor import (  # noqa: E402
-    enumerate_dicom_series,
-    single_ct_series_fields_if_unique,
-)
+from src.dicom_processor import enumerate_dicom_series  # noqa: E402
 from src.patient_manager import get_patient_metadata, normalize_patient_id  # noqa: E402
 from src.pipeline import find_patient_folders, process_single_patient  # noqa: E402
 
@@ -172,6 +170,7 @@ CSV_COLUMNS = [
     "study_id",
     "series_instance_uid",
     "series_description",
+    "series_catalog",
     "patient_output_dir",
     "segmentation_dir",
     "status",
@@ -249,18 +248,55 @@ def expected_patient_output_dir(output_base_dir: Path, patient_id: str, study_id
     return Path(output_base_dir) / normalize_patient_id(patient_id) / _safe_study_id(study_id)
 
 
-def autofill_series_if_single_ct(row: Dict[str, str]) -> None:
-    """When exactly one CT series exists under the case folder, set CSV series columns."""
-    folder = Path(row["dicom_folder"])
+def enrich_row_with_series_catalog(row: Dict[str, str], series_items: List[Dict[str, object]]) -> None:
+    """
+    Store JSON ``series_catalog`` on the row (for workflow 2 without re-scanning DICOM).
+    If there is exactly one CT series, pre-fill ``series_instance_uid`` / ``series_description``.
+    """
+    catalog = [
+        {
+            "series_instance_uid": str(it.get("series_instance_uid", "") or ""),
+            "series_description": str(it.get("series_description", "") or ""),
+            "modality": str(it.get("modality", "") or ""),
+            "num_instances": int(it.get("num_instances", 0) or 0),
+            "study_instance_uid": str(it.get("study_instance_uid", "") or ""),
+        }
+        for it in series_items
+    ]
+    row["series_catalog"] = json.dumps(catalog, ensure_ascii=False) if catalog else ""
+
+    ct_items = [it for it in series_items if str(it.get("modality", "") or "").strip().upper() == "CT"]
+    if len(ct_items) == 1:
+        only = ct_items[0]
+        row["series_instance_uid"] = str(only.get("series_instance_uid", "") or "")
+        row["series_description"] = str(only.get("series_description", "") or "")
+
+
+def parse_series_catalog_from_row(row: Dict[str, str]) -> Optional[List[Dict[str, object]]]:
+    """Return series dicts from ``series_catalog`` JSON, or None if missing or unusable."""
+    raw = (row.get("series_catalog") or "").strip()
+    if not raw:
+        return None
     try:
-        pair = single_ct_series_fields_if_unique(folder)
-    except Exception:
-        return
-    if not pair:
-        return
-    uid, desc = pair
-    row["series_instance_uid"] = uid
-    row["series_description"] = desc
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    out: List[Dict[str, object]] = []
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        out.append(
+            {
+                "series_instance_uid": str(it.get("series_instance_uid", "") or ""),
+                "series_description": str(it.get("series_description", "") or ""),
+                "modality": str(it.get("modality", "") or ""),
+                "num_instances": int(it.get("num_instances", 0) or 0),
+                "study_instance_uid": str(it.get("study_instance_uid", "") or ""),
+            }
+        )
+    return out or None
 
 
 def read_csv_rows(csv_path: Path) -> List[Dict[str, str]]:
@@ -286,6 +322,47 @@ def write_csv_rows(csv_path: Path, rows: List[Dict[str, str]]) -> None:
             writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
+def build_one_case_row(
+    patient_folder: Path,
+    output_base_dir: Path,
+    study_counts: Dict[str, int],
+) -> Dict[str, str]:
+    """Build one CSV row for a discovered patient DICOM folder (no series scan yet)."""
+    metadata = get_patient_metadata(patient_folder)
+    patient_id = metadata.get("patient_id") or patient_folder.name
+    patient_name = metadata.get("patient_name") or ""
+    exam_date = metadata.get("study_date") or ""
+    study_name = patient_folder.name
+
+    key = f"{patient_id}_{study_name}"
+    count = study_counts.get(key, 0)
+    study_counts[key] = count + 1
+    study_id = study_name if count == 0 else f"{study_name}_{count}"
+
+    patient_output_dir = expected_patient_output_dir(output_base_dir, patient_id, study_id)
+    segmentation_dir = patient_output_dir / "segmentations"
+
+    return {
+        "case_id": uuid.uuid4().hex[:12],
+        "patient_id": patient_id,
+        "patient_name": patient_name,
+        "exam_date": exam_date,
+        "dicom_folder": str(patient_folder),
+        "output_base_dir": str(output_base_dir),
+        "study_id": study_id,
+        "series_instance_uid": "",
+        "series_description": "",
+        "series_catalog": "",
+        "patient_output_dir": str(patient_output_dir),
+        "segmentation_dir": str(segmentation_dir),
+        "status": "pending",
+        "error": "",
+        "was_skipped": "",
+        "segmentation_duration_seconds": "",
+        "updated_at": _now(),
+    }
+
+
 def build_case_rows(input_path: Path, output_base_dir: Path) -> List[Dict[str, str]]:
     patient_folders = find_patient_folders(input_path)
     if not patient_folders:
@@ -295,40 +372,14 @@ def build_case_rows(input_path: Path, output_base_dir: Path) -> List[Dict[str, s
     study_counts: Dict[str, int] = {}
 
     for patient_folder in patient_folders:
-        metadata = get_patient_metadata(patient_folder)
-        patient_id = metadata.get("patient_id") or patient_folder.name
-        patient_name = metadata.get("patient_name") or ""
-        exam_date = metadata.get("study_date") or ""
-        study_name = patient_folder.name
-
-        key = f"{patient_id}_{study_name}"
-        count = study_counts.get(key, 0)
-        study_counts[key] = count + 1
-        study_id = study_name if count == 0 else f"{study_name}_{count}"
-
-        patient_output_dir = expected_patient_output_dir(output_base_dir, patient_id, study_id)
-        segmentation_dir = patient_output_dir / "segmentations"
-
-        rows.append(
-            {
-                "case_id": uuid.uuid4().hex[:12],
-                "patient_id": patient_id,
-                "patient_name": patient_name,
-                "exam_date": exam_date,
-                "dicom_folder": str(patient_folder),
-                "output_base_dir": str(output_base_dir),
-                "study_id": study_id,
-                "series_instance_uid": "",
-                "series_description": "",
-                "patient_output_dir": str(patient_output_dir),
-                "segmentation_dir": str(segmentation_dir),
-                "status": "pending",
-                "error": "",
-                "was_skipped": "",
-                "segmentation_duration_seconds": "",
-                "updated_at": _now(),
-            }
-        )
+        row = build_one_case_row(patient_folder, output_base_dir, study_counts)
+        try:
+            items = enumerate_dicom_series(patient_folder)
+        except Exception:
+            logger.exception("Series enumeration failed for %s", patient_folder)
+            items = []
+        enrich_row_with_series_catalog(row, items)
+        rows.append(row)
 
     return rows
 
@@ -520,6 +571,13 @@ class BatchVerificationApp:
 
         self.w1_status_var = tk.StringVar(value="Status: waiting for scan")
         ttk.Label(frame, textvariable=self.w1_status_var).pack(anchor="w", pady=5)
+        ttk.Label(
+            frame,
+            text="While scanning, each study appears in the list as it is read. "
+            "Saving CSV stores series_catalog (JSON) so workflow 2 can list series without rescanning DICOM.",
+            wraplength=920,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 4))
 
         list_frame = ttk.LabelFrame(frame, text="Cases", padding=5)
         list_frame.pack(fill="both", expand=True)
@@ -556,39 +614,69 @@ class BatchVerificationApp:
         if self._w1_scanning:
             return
 
+        self.w1_cases.delete(0, tk.END)
+        self.w1_rows = []
+        self.w1_save_button.config(state=tk.DISABLED)
         self._w1_scanning = True
         self.w1_scan_button.config(state=tk.DISABLED)
-        self.w1_status_var.set("Status: scanning cases (background thread; UI should stay responsive)...")
+        self.w1_status_var.set("Status: discovering case folders…")
 
         def worker() -> None:
+            study_counts: Dict[str, int] = {}
+            rows: List[Dict[str, str]] = []
             try:
-                rows = build_case_rows(input_path, output_base_dir)
-                for row in rows:
-                    autofill_series_if_single_ct(row)
+                folders = find_patient_folders(input_path)
+                if not folders:
+                    raise ValueError(f"No patient folders found in {input_path}")
+                total = len(folders)
+                self.root.after(
+                    0,
+                    lambda t=total: self.w1_status_var.set(
+                        f"Status: reading DICOM series 0/{t} (studies appear below as they finish)…"
+                    ),
+                )
+                for i, patient_folder in enumerate(folders, 1):
+                    row = build_one_case_row(patient_folder, output_base_dir, study_counts)
+                    try:
+                        items = enumerate_dicom_series(patient_folder)
+                    except Exception:
+                        logger.exception("Series enumeration failed for %s", patient_folder)
+                        items = []
+                    enrich_row_with_series_catalog(row, items)
+                    rows.append(row)
+                    n_series = len(items)
+                    label = (
+                        f"{row['patient_id']} | {row['exam_date']} | "
+                        f"{Path(row['dicom_folder']).name} | {row['status']} | {n_series} series"
+                    )
+                    self.root.after(0, self._w1_append_scanned_row, label, i, total)
+                self.root.after(0, lambda r=list(rows): self._w1_scan_finish_ok(r))
             except Exception as exc:
                 self.root.after(0, lambda e=exc: self._w1_scan_finish_error(e))
-                return
-            self.root.after(0, lambda r=rows: self._w1_scan_finish_ok(r))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _w1_append_scanned_row(self, label: str, index: int, total: int) -> None:
+        self.w1_cases.insert(tk.END, label)
+        self.w1_cases.see(tk.END)
+        short = label if len(label) <= 100 else label[:97] + "…"
+        self.w1_status_var.set(f"Status: reading series {index}/{total} — {short}")
 
     def _w1_scan_finish_ok(self, rows: List[Dict[str, str]]) -> None:
         self._w1_scanning = False
         self.w1_scan_button.config(state=tk.NORMAL)
         self.w1_rows = rows
-        self.w1_cases.delete(0, tk.END)
-        for row in rows:
-            label = (
-                f"{row['patient_id']} | {row['exam_date']} | "
-                f"{Path(row['dicom_folder']).name} | {row['status']}"
-            )
-            self.w1_cases.insert(tk.END, label)
-        self.w1_status_var.set(f"Status: found {len(rows)} case(s)")
+        self.w1_status_var.set(
+            f"Status: done — {len(rows)} case(s). "
+            "Save CSV to keep series_catalog for workflow 2 (skips DICOM series rescan when present)."
+        )
         self.w1_save_button.config(state=tk.NORMAL)
 
     def _w1_scan_finish_error(self, exc: Exception) -> None:
         self._w1_scanning = False
         self.w1_scan_button.config(state=tk.NORMAL)
+        self.w1_cases.delete(0, tk.END)
+        self.w1_rows = []
         logger.exception("Failed to scan cases")
         messagebox.showerror("Scan Failed", str(exc))
         self.w1_status_var.set("Status: scan failed")
@@ -649,7 +737,7 @@ class BatchVerificationApp:
         self.sp_study_list.bind("<<ListboxSelect>>", self.sp_on_study_select)
         pane.add(left, weight=1)
 
-        right = ttk.LabelFrame(pane, text="Series (DICOM under selected study)", padding=6)
+        right = ttk.LabelFrame(pane, text="Series (from CSV catalog if present, else DICOM)", padding=6)
         self.sp_series_list = tk.Listbox(right, exportselection=False, height=22)
         self.sp_series_list.pack(side=tk.LEFT, fill="both", expand=True)
         sb_r = ttk.Scrollbar(right, command=self.sp_series_list.yview)
@@ -692,11 +780,13 @@ class BatchVerificationApp:
         self.sp_study_list.delete(0, tk.END)
         for row in self.sp_rows:
             suid = (row.get("series_instance_uid") or "").strip()
-            flag = "series OK" if suid else "no series"
+            sflag = "series OK" if suid else "no series"
+            has_cat = bool((row.get("series_catalog") or "").strip())
+            cflag = "catalog" if has_cat else "no catalog"
             folder = Path(row.get("dicom_folder", "") or ".")
             label = (
                 f"{row.get('patient_id', '')} | {row.get('study_id', '')} | {row.get('exam_date', '')} | "
-                f"{folder.name} | {flag}"
+                f"{folder.name} | {sflag} | {cflag}"
             )
             self.sp_study_list.insert(tk.END, label)
 
@@ -720,19 +810,29 @@ class BatchVerificationApp:
             return
         row = self.sp_rows[idx]
         folder = Path(row.get("dicom_folder", ""))
-        if not folder.is_dir():
-            self.sp_status_var.set(f"DICOM folder not found:\n{folder}")
-            return
-        try:
-            items = enumerate_dicom_series(folder)
-        except Exception as exc:
-            logger.exception("Series enumeration failed")
-            self.sp_status_var.set(f"Series scan failed: {exc}")
-            messagebox.showerror("Series scan failed", str(exc))
-            return
+        catalog = parse_series_catalog_from_row(row)
+        if catalog is not None:
+            items = catalog
+            source = "CSV catalog"
+            if not folder.is_dir():
+                self.sp_status_var.set(
+                    f"DICOM folder not found (series list from saved catalog only):\n{folder}"
+                )
+        else:
+            if not folder.is_dir():
+                self.sp_status_var.set(f"DICOM folder not found:\n{folder}")
+                return
+            try:
+                items = enumerate_dicom_series(folder)
+            except Exception as exc:
+                logger.exception("Series enumeration failed")
+                self.sp_status_var.set(f"Series scan failed: {exc}")
+                messagebox.showerror("Series scan failed", str(exc))
+                return
+            source = "DICOM"
         self.sp_series_items = items
         if not items:
-            self.sp_status_var.set(f"No DICOM files under {folder.name}")
+            self.sp_status_var.set(f"No series data for {folder.name} (empty catalog and no DICOM headers found)")
             return
         for it in items:
             uid = str(it.get("series_instance_uid", "") or "")
@@ -742,7 +842,9 @@ class BatchVerificationApp:
             uid_disp = uid if uid else "(missing SeriesInstanceUID)"
             line = f"{mod or '?'} | n={n} | {desc[:48]}{'…' if len(desc) > 48 else ''} | {uid_disp}"
             self.sp_series_list.insert(tk.END, line)
-        self.sp_status_var.set(f"Study {row.get('patient_id', '')}: {len(items)} series in {folder.name}")
+        self.sp_status_var.set(
+            f"Study {row.get('patient_id', '')}: {len(items)} series ({source}) under {folder.name}"
+        )
 
     def sp_mark_selection_on_csv(self) -> None:
         if self.sp_csv_path is None or not self.sp_rows:

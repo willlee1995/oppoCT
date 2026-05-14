@@ -1,6 +1,5 @@
 /output
 /out
-/__pycache__
 /oppo
 /src/__pycache__
 /data
@@ -16,3 +15,5 @@ result.csv
 /venv
 /weight_download_work
 /weight_download_work.zip
+/.venv
+/__pycache__

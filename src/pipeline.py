@@ -10,11 +10,17 @@ import os
 import shutil
 import tempfile
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from .csv_exporter import export_batch_to_csv, export_patient_to_csv
-from .dicom_processor import dicom_to_nifti, extract_patient_id
+from .dicom_processor import (
+    dicom_to_nifti,
+    extract_patient_id,
+    get_study_instance_uid_for_grouping,
+    iter_dicom_file_paths_streaming,
+)
 from .patient_manager import create_patient_output_dir
 from .segmentator import segment_lumbar_vertebrae, verify_segmentation_output
 from .statistics import calculate_patient_statistics, save_statistics_json
@@ -176,29 +182,83 @@ def process_single_patient(
     return result
 
 
-def find_patient_folders(input_path: Path) -> List[Path]:
-    """
-    Find patient DICOM folders in input directory (recursively).
-    
-    Args:
-        input_path: Input path (file or directory)
-        
-    Returns:
-        List of patient folder paths
-    """
-    patient_folders = []
-    
+def _find_patient_folders_legacy_leaf_dirs(input_path: Path) -> List[Path]:
+    """One folder per directory that directly contains a .dcm file (old behaviour)."""
+    patient_folders: List[Path] = []
     if input_path.is_file():
-        # Single file - use parent directory
         patient_folders.append(input_path.parent)
     elif input_path.is_dir():
-        # Recursively search for directories containing DICOM files
         for root, _, files in os.walk(input_path):
-            if any(f.lower().endswith('.dcm') for f in files):
+            if any(f.lower().endswith((".dcm", ".dicom")) for f in files):
                 patient_folders.append(Path(root))
-    
-    # Sort for consistent processing order
-    return sorted(list(set(patient_folders)))
+    return sorted(set(patient_folders))
+
+
+def _common_root_for_dicom_paths(paths: List[Path]) -> Path:
+    """Smallest directory tree root that contains all given DICOM file paths."""
+    if not paths:
+        raise ValueError("paths must be non-empty")
+    if len(paths) == 1:
+        return paths[0].parent
+    try:
+        common = os.path.commonpath([str(p.resolve()) for p in paths])
+    except ValueError:
+        return paths[0].parent
+    p = Path(common)
+    if p.is_file():
+        return p.parent
+    return p
+
+
+def find_patient_folders(input_path: Path) -> List[Path]:
+    """
+    Find DICOM case roots under ``input_path``.
+
+    Files are grouped by **StudyInstanceUID** (from a light header read). Each group
+    becomes one case folder: the common ancestor directory of all instances in that
+    study. This avoids treating every series subfolder as a separate study when
+    series live under one study tree.
+
+    Falls back to the legacy rule (one row per directory that directly contains
+    ``.dcm`` files) if no readable DICOM headers are found.
+
+    Args:
+        input_path: Input path (file or directory)
+
+    Returns:
+        Sorted list of folder paths to pass as ``dicom_folder`` for each case.
+    """
+    if input_path.is_file():
+        return sorted({input_path.parent})
+    if not input_path.is_dir():
+        return []
+
+    by_study: Dict[str, List[Path]] = defaultdict(list)
+    for fp in iter_dicom_file_paths_streaming(input_path):
+        suid = get_study_instance_uid_for_grouping(fp)
+        key = suid if suid else f"__NO_STUDY_UID__:{fp.parent.resolve()}"
+        by_study[key].append(fp)
+
+    if not by_study:
+        return _find_patient_folders_legacy_leaf_dirs(input_path)
+
+    roots: List[Path] = []
+    for paths in by_study.values():
+        try:
+            roots.append(_common_root_for_dicom_paths(paths))
+        except ValueError:
+            continue
+
+    if not roots:
+        return _find_patient_folders_legacy_leaf_dirs(input_path)
+
+    out = sorted(set(roots))
+    logging.info(
+        "find_patient_folders: grouped DICOM under %s into %d case root(s) by StudyInstanceUID",
+        input_path,
+        len(out),
+    )
+    return out
 
 
 def process_batch(

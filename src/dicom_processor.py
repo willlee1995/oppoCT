@@ -42,6 +42,14 @@ def _read_dicom_series_header_tags(fp: Path):
             return None
 
 
+def get_study_instance_uid_for_grouping(fp: Path) -> str:
+    """Return StudyInstanceUID for batch folder grouping, or empty string if unreadable."""
+    ds = _read_dicom_series_header_tags(fp)
+    if ds is None:
+        return ""
+    return str(getattr(ds, "StudyInstanceUID", "") or "").strip()
+
+
 def iter_dicom_file_paths(dicom_folder: Path) -> List[Path]:
     """Return sorted unique paths to DICOM instances under ``dicom_folder`` (root + recursive)."""
     paths = list(iter_dicom_file_paths_streaming(dicom_folder))
