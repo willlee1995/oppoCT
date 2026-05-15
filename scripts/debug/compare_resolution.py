@@ -1,6 +1,12 @@
 
-import nibabel as nib
+import sys
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import nibabel as nib
 import numpy as np
 from src.pipeline import find_patient_folders
 from src.dicom_processor import dicom_to_nifti

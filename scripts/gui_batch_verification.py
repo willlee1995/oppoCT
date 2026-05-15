@@ -412,6 +412,10 @@ def process_segmentation_row(
         return row
 
     series_uid = (row.get("series_instance_uid") or "").strip() or None
+    if not series_uid:
+        raise RuntimeError(
+            "Missing series_instance_uid: choose a series in workflow 2 before running batch segmentation."
+        )
 
     result = process_single_patient(
         dicom_folder=dicom_folder,
@@ -738,18 +742,42 @@ class BatchVerificationApp:
         pane.add(left, weight=1)
 
         right = ttk.LabelFrame(pane, text="Series (from CSV catalog if present, else DICOM)", padding=6)
-        self.sp_series_list = tk.Listbox(right, exportselection=False, height=22)
+        series_bar = ttk.Frame(right)
+        series_bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(series_bar, text="Select — mark on CSV", command=self.sp_mark_selection_on_csv).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Button(
+            series_bar,
+            text="Auto-select largest series",
+            command=self.sp_auto_select_largest_series,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(
+            series_bar,
+            text="Auto-select largest for all unset",
+            command=self.sp_auto_select_largest_all_unset,
+        ).pack(side=tk.LEFT)
+
+        list_frame = ttk.Frame(right)
+        list_frame.pack(fill="both", expand=True)
+        self.sp_series_list = tk.Listbox(
+            list_frame,
+            exportselection=False,
+            height=22,
+            selectbackground="#2b6cb0",
+            selectforeground="#ffffff",
+            activestyle="none",
+        )
         self.sp_series_list.pack(side=tk.LEFT, fill="both", expand=True)
-        sb_r = ttk.Scrollbar(right, command=self.sp_series_list.yview)
+        sb_r = ttk.Scrollbar(list_frame, command=self.sp_series_list.yview)
         sb_r.pack(side=tk.RIGHT, fill=tk.Y)
         self.sp_series_list.config(yscrollcommand=sb_r.set)
+        self._sp_series_list_normal_bg = self.sp_series_list.cget("bg")
+        self._sp_series_csv_tint_bg = "#d6ebff"
         pane.add(right, weight=1)
 
         actions = ttk.Frame(frame, padding=(0, 8, 0, 0))
         actions.pack(fill="x")
-        ttk.Button(actions, text="Select — mark on CSV", command=self.sp_mark_selection_on_csv).pack(
-            side=tk.LEFT, padx=(0, 10)
-        )
         ttk.Button(actions, text="Clear series for selected study", command=self.sp_clear_series_for_selected).pack(
             side=tk.LEFT
         )
@@ -802,6 +830,41 @@ class BatchVerificationApp:
             return None
         return int(sel[0])
 
+    def _sp_series_items_for_row(
+        self, row: Dict[str, str]
+    ) -> Tuple[Optional[List[Dict[str, object]]], Optional[str], bool]:
+        """
+        Resolve series list for a CSV row.
+
+        Returns ``(items, None, False)`` on success (``items`` may be empty).
+        On failure returns ``(None, message, scan_exception)`` where ``scan_exception``
+        is True for DICOM enumeration errors (caller may show a dialog).
+        """
+        folder = Path(row.get("dicom_folder", ""))
+        catalog = parse_series_catalog_from_row(row)
+        if catalog is not None:
+            return catalog, None, False
+        if not folder.is_dir():
+            return None, f"DICOM folder not found:\n{folder}", False
+        try:
+            return enumerate_dicom_series(folder), None, False
+        except Exception as exc:
+            logger.exception("Series enumeration failed")
+            return None, str(exc), True
+
+    @staticmethod
+    def _sp_pick_largest_series_item(items: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
+        if not items:
+            return None
+        best = items[0]
+        best_n = int(best.get("num_instances", 0) or 0)
+        for it in items[1:]:
+            n = int(it.get("num_instances", 0) or 0)
+            if n > best_n:
+                best_n = n
+                best = it
+        return best
+
     def sp_on_study_select(self, _event=None) -> None:
         self.sp_series_list.delete(0, tk.END)
         self.sp_series_items = []
@@ -811,25 +874,17 @@ class BatchVerificationApp:
         row = self.sp_rows[idx]
         folder = Path(row.get("dicom_folder", ""))
         catalog = parse_series_catalog_from_row(row)
-        if catalog is not None:
-            items = catalog
-            source = "CSV catalog"
-            if not folder.is_dir():
-                self.sp_status_var.set(
-                    f"DICOM folder not found (series list from saved catalog only):\n{folder}"
-                )
-        else:
-            if not folder.is_dir():
-                self.sp_status_var.set(f"DICOM folder not found:\n{folder}")
-                return
-            try:
-                items = enumerate_dicom_series(folder)
-            except Exception as exc:
-                logger.exception("Series enumeration failed")
-                self.sp_status_var.set(f"Series scan failed: {exc}")
-                messagebox.showerror("Series scan failed", str(exc))
-                return
-            source = "DICOM"
+        items, err, scan_exc = self._sp_series_items_for_row(row)
+        if items is None:
+            self.sp_status_var.set(err or "Could not list series.")
+            if scan_exc:
+                messagebox.showerror("Series scan failed", err)
+            return
+        if catalog is not None and not folder.is_dir():
+            self.sp_status_var.set(
+                f"DICOM folder not found (series list from saved catalog only):\n{folder}"
+            )
+        source = "CSV catalog" if catalog is not None else "DICOM"
         self.sp_series_items = items
         if not items:
             self.sp_status_var.set(f"No series data for {folder.name} (empty catalog and no DICOM headers found)")
@@ -845,6 +900,124 @@ class BatchVerificationApp:
         self.sp_status_var.set(
             f"Study {row.get('patient_id', '')}: {len(items)} series ({source}) under {folder.name}"
         )
+        self._sp_tint_series_list_for_csv_row(row)
+        self._sp_select_series_matching_csv(row)
+
+    def _sp_tint_series_list_for_csv_row(self, row: Dict[str, str]) -> None:
+        """Reset row backgrounds; tint the row that matches the CSV's saved SeriesInstanceUID."""
+        default = getattr(self, "_sp_series_list_normal_bg", self.sp_series_list.cget("bg"))
+        tint = getattr(self, "_sp_series_csv_tint_bg", "#d6ebff")
+        n = self.sp_series_list.size()
+        for i in range(n):
+            self.sp_series_list.itemconfigure(i, background=default)
+        uid = (row.get("series_instance_uid") or "").strip()
+        if not uid:
+            return
+        for i, it in enumerate(self.sp_series_items):
+            if str(it.get("series_instance_uid", "") or "").strip() == uid:
+                self.sp_series_list.itemconfigure(i, background=tint)
+                break
+
+    def _sp_select_series_matching_csv(self, row: Dict[str, str]) -> None:
+        """Listbox selection follows the CSV's current series UID when present in this study."""
+        uid = (row.get("series_instance_uid") or "").strip()
+        if not uid:
+            return
+        for i, it in enumerate(self.sp_series_items):
+            if str(it.get("series_instance_uid", "") or "").strip() == uid:
+                self.sp_series_list.selection_clear(0, tk.END)
+                self.sp_series_list.selection_set(i)
+                self.sp_series_list.activate(i)
+                self.sp_series_list.see(i)
+                break
+
+    def sp_auto_select_largest_series(self) -> None:
+        """Select the series row with the highest instance count (ties: first wins)."""
+        if not self.sp_series_items:
+            messagebox.showinfo("No series", "Choose a study so series appear in the list first.")
+            return
+        best_i = 0
+        best_n = -1
+        for i, it in enumerate(self.sp_series_items):
+            n = int(it.get("num_instances", 0) or 0)
+            if n > best_n:
+                best_n = n
+                best_i = i
+        self.sp_series_list.selection_clear(0, tk.END)
+        self.sp_series_list.selection_set(best_i)
+        self.sp_series_list.activate(best_i)
+        self.sp_series_list.see(best_i)
+
+    def sp_auto_select_largest_all_unset(self) -> None:
+        """For every CSV row without ``series_instance_uid``, pick the series with the most instances and save."""
+        if self.sp_csv_path is None or not self.sp_rows:
+            messagebox.showerror("No CSV", "Load a batch CSV first.")
+            return
+        candidates = [
+            i for i, row in enumerate(self.sp_rows) if not (row.get("series_instance_uid") or "").strip()
+        ]
+        if not candidates:
+            messagebox.showinfo("Nothing to do", "Every study already has a series selected.")
+            return
+        updated = 0
+        skipped: List[Tuple[str, str]] = []
+        for i in candidates:
+            row = self.sp_rows[i]
+            folder = Path(row.get("dicom_folder") or ".")
+            label = (
+                (row.get("patient_id") or row.get("study_id") or folder.name or str(i)).strip() or str(i)
+            )
+            items, err, _scan_exc = self._sp_series_items_for_row(row)
+            if items is None:
+                skipped.append((label, err or "unknown error"))
+                continue
+            if not items:
+                skipped.append((label, "no series in catalog or DICOM"))
+                continue
+            pick = self._sp_pick_largest_series_item(items)
+            if pick is None:
+                skipped.append((label, "no series to choose"))
+                continue
+            suid = str(pick.get("series_instance_uid", "") or "").strip()
+            if not suid:
+                skipped.append((label, "largest series has no SeriesInstanceUID"))
+                continue
+            row["series_instance_uid"] = suid
+            row["series_description"] = str(pick.get("series_description", "") or "")
+            row["updated_at"] = _now()
+            updated += 1
+        if updated == 0:
+            lines = ["No rows were updated.", ""]
+            if skipped:
+                lines.append(f"Skipped {len(skipped)}:")
+                for lab, reason in skipped[:10]:
+                    lines.append(f"  • {lab}: {reason[:120]}")
+                if len(skipped) > 10:
+                    lines.append(f"  … and {len(skipped) - 10} more")
+            messagebox.showinfo("Bulk auto-select", "\n".join(lines))
+            return
+        try:
+            write_csv_rows(self.sp_csv_path, self.sp_rows)
+        except Exception as exc:
+            logger.exception("Failed to write CSV after bulk auto-select")
+            messagebox.showerror("Save failed", str(exc))
+            return
+        self.sp_refresh_study_listbox()
+        si = self.sp_selected_study_index()
+        if si is not None and si < len(self.sp_rows):
+            self.sp_study_list.selection_clear(0, tk.END)
+            self.sp_study_list.selection_set(si)
+            self.sp_study_list.see(si)
+            self.sp_on_study_select()
+        self.sp_status_var.set(f"Bulk auto-select: saved {updated} row(s); skipped {len(skipped)}.")
+        lines = [f"Updated {updated} row(s) and saved the CSV.", ""]
+        if skipped:
+            lines.append(f"Skipped {len(skipped)}:")
+            for lab, reason in skipped[:10]:
+                lines.append(f"  • {lab}: {reason[:120]}")
+            if len(skipped) > 10:
+                lines.append(f"  … and {len(skipped) - 10} more")
+        messagebox.showinfo("Bulk auto-select", "\n".join(lines))
 
     def sp_mark_selection_on_csv(self) -> None:
         if self.sp_csv_path is None or not self.sp_rows:
@@ -938,6 +1111,12 @@ class BatchVerificationApp:
         ttk.Checkbutton(config, text="Retry failed_pipeline rows", variable=self.w2_retry_failed_var).grid(
             row=2, column=1, sticky="w", padx=190, pady=2
         )
+        ttk.Label(
+            config,
+            text="Only CSV rows with a selected series (series_instance_uid from workflow 2) are segmented.",
+            wraplength=780,
+            justify=tk.LEFT,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=(6, 0))
 
         cuda_frame = ttk.LabelFrame(frame, text="PyTorch / CUDA (workflow 3)", padding=10)
         cuda_frame.pack(fill="x", pady=5)
@@ -1076,13 +1255,31 @@ class BatchVerificationApp:
                 return
 
             pending: List[Tuple[int, Dict[str, str]]] = []
+            skipped_no_series = 0
             for idx, row in enumerate(rows):
                 status = row.get("status", "pending").lower()
-                if status == "pending" or (retry_failed and status == "failed_pipeline"):
-                    pending.append((idx, row))
+                if not (status == "pending" or (retry_failed and status == "failed_pipeline")):
+                    continue
+                if not (row.get("series_instance_uid") or "").strip():
+                    skipped_no_series += 1
+                    continue
+                pending.append((idx, row))
 
             total = len(pending)
-            self.root.after(0, self.w2_log, f"Found {total} pending case(s).")
+            self.root.after(0, self.w2_log, f"Found {total} case(s) to segment (series selected).")
+            if skipped_no_series:
+                self.root.after(
+                    0,
+                    self.w2_log,
+                    f"Skipping {skipped_no_series} pending row(s) with no series_instance_uid "
+                    "(assign in workflow 2).",
+                )
+            if total == 0 and skipped_no_series:
+                self.root.after(
+                    0,
+                    self.w2_log,
+                    "Nothing to run: pending rows need a series chosen in workflow 2.",
+                )
 
             temp_dir = Path(tempfile.mkdtemp(prefix="oppoct_batch_gui_"))
             for count, (idx, row) in enumerate(pending, 1):
@@ -1279,6 +1476,46 @@ class BatchVerificationApp:
         self.w3_open_button.config(state=tk.NORMAL)
         self.w3_na_button.config(state=tk.NORMAL)
 
+    def _w3_show_viewer_loading_dialog(self, row: Dict[str, str]) -> tk.Toplevel:
+        patient_label = row.get("patient_id") or row.get("patient_name") or "selected case"
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Opening Viewer")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text=f"Opening verification viewer for {patient_label}...",
+            font=("Helvetica", 11, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            frame,
+            text="Loading CT volume and segmentation masks. This can take a moment.",
+            wraplength=360,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(8, 12))
+        progress = ttk.Progressbar(frame, mode="indeterminate", length=320)
+        progress.pack(fill="x")
+        progress.start(12)
+
+        self.root.update_idletasks()
+        width = dialog.winfo_reqwidth()
+        height = dialog.winfo_reqheight()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_w = max(self.root.winfo_width(), 1)
+        root_h = max(self.root.winfo_height(), 1)
+        x = root_x + max((root_w - width) // 2, 0)
+        y = root_y + max((root_h - height) // 2, 0)
+        dialog.geometry(f"+{x}+{y}")
+        dialog.lift()
+        dialog.grab_set()
+        self.root.update()
+        return dialog
+
     def w3_open_viewer(self) -> None:
         if self.w3_csv_path is None:
             return
@@ -1297,7 +1534,10 @@ class BatchVerificationApp:
             messagebox.showerror("Missing Segmentation", f"No segmentation masks found:\n{segmentation_dir}")
             return
 
+        loading_dialog: Optional[tk.Toplevel] = None
         try:
+            self.w3_open_button.config(state=tk.DISABLED)
+            loading_dialog = self._w3_show_viewer_loading_dialog(row)
             suid = (row.get("series_instance_uid") or "").strip() or None
             ct_volume, ct_img = load_ct_for_verification(
                 dicom_folder, segmentation_dir, series_instance_uid=suid
@@ -1310,6 +1550,11 @@ class BatchVerificationApp:
                 patient_id=row.get("patient_id") or dicom_folder.name,
                 exam_date=row.get("exam_date") or None,
             )
+            if loading_dialog is not None and loading_dialog.winfo_exists():
+                loading_dialog.grab_release()
+                loading_dialog.destroy()
+                loading_dialog = None
+                self.root.update_idletasks()
             result = viewer.show(tk_root=self.root)
             self.w3_rows[idx] = apply_verification_result(row, result)
             write_csv_rows(self.w3_csv_path, self.w3_rows)
@@ -1320,7 +1565,18 @@ class BatchVerificationApp:
             row["error"] = str(exc)
             row["updated_at"] = _now()
             write_csv_rows(self.w3_csv_path, self.w3_rows)
+            if loading_dialog is not None and loading_dialog.winfo_exists():
+                loading_dialog.grab_release()
+                loading_dialog.destroy()
+                loading_dialog = None
+                self.root.update_idletasks()
             messagebox.showerror("Verification Failed", str(exc))
+        finally:
+            if loading_dialog is not None and loading_dialog.winfo_exists():
+                loading_dialog.grab_release()
+                loading_dialog.destroy()
+            if self.w3_selected_original_index() is not None:
+                self.w3_open_button.config(state=tk.NORMAL)
 
     def w3_mark_not_applicable(self) -> None:
         self._w3_write_qc_status("not applicable", "Case marked not applicable.")

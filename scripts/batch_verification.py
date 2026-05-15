@@ -41,7 +41,7 @@ from src.dicom_processor import dicom_to_nifti
 from src.patient_manager import get_patient_metadata, create_patient_output_dir
 from src.pipeline import find_patient_folders
 from src.visualizer import find_representative_slices
-from verify_segmentation import load_dicom_series, load_segmentation_mask
+from verify_segmentation import load_segmentation_mask
 
 logger.info("All imports complete.")
 
@@ -107,12 +107,12 @@ class VerificationViewer:
         self.window_level = window_level
         self.window_width = window_width
 
-        # Volume dimensions: (height, width, depth) for axial view
-        self.axial_shape = ct_volume.shape  # (H, W, D)
+        # Volume dimensions are the NIfTI voxel axes, typically (left-right, anterior-posterior, inferior-superior).
+        self.axial_shape = ct_volume.shape
 
         # Current slice indices
         self.axial_slice = ct_volume.shape[2] // 2  # Depth axis
-        self.sagittal_slice = ct_volume.shape[1] // 2  # Width axis
+        self.sagittal_slice = ct_volume.shape[0] // 2  # Left-right axis
 
         # Selected slices for HU calculation
         try:
@@ -142,11 +142,21 @@ class VerificationViewer:
             if short_name not in self.label_mapping:
                 self.label_mapping[short_name] = v
 
+    @staticmethod
+    def _format_axial_slice(image_slice: np.ndarray) -> np.ndarray:
+        """Display axial slices with left-right on the horizontal axis."""
+        return image_slice.T
+
+    @staticmethod
+    def _format_sagittal_slice(image_slice: np.ndarray) -> np.ndarray:
+        """Display sagittal slices with superior-inferior on the vertical axis."""
+        return np.rot90(image_slice, k=-1)
+
     def calculate_sagittal_view(self, slice_idx: int) -> np.ndarray:
-        """Extract sagittal slice from CT volume."""
-        if slice_idx < 0 or slice_idx >= self.axial_shape[1]:
-            slice_idx = max(0, min(slice_idx, self.axial_shape[1] - 1))
-        sagittal_slice = self.ct_volume[:, slice_idx, :]
+        """Extract a true sagittal slice from CT volume."""
+        if slice_idx < 0 or slice_idx >= self.axial_shape[0]:
+            slice_idx = max(0, min(slice_idx, self.axial_shape[0] - 1))
+        sagittal_slice = self.ct_volume[slice_idx, :, :]
         return sagittal_slice
 
     def calculate_volumetric_hu(self, vertebra_name: str) -> float:
@@ -165,17 +175,12 @@ class VerificationViewer:
 
         for slice_idx in range(self.axial_shape[2]):
             ct_slice = self.ct_volume[:, :, slice_idx]
-            ct_slice = np.fliplr(ct_slice)
-
             mask_slice = mask[:, :, slice_idx]
-            mask_slice = np.rot90(mask_slice, k=-1)
-            mask_slice = np.flipud(mask_slice)
 
-            if np.any(mask_slice > 0):
-                if ct_slice.shape == mask_slice.shape:
-                    masked_hu_values = ct_slice[mask_slice > 0]
-                    total_sum += np.sum(masked_hu_values)
-                    total_count += masked_hu_values.size
+            if np.any(mask_slice > 0) and ct_slice.shape == mask_slice.shape:
+                masked_hu_values = ct_slice[mask_slice > 0]
+                total_sum += np.sum(masked_hu_values)
+                total_count += masked_hu_values.size
 
         if total_count == 0:
             return 0.0
@@ -190,7 +195,6 @@ class VerificationViewer:
         for slice_idx in slice_indices:
             if 0 <= slice_idx < self.axial_shape[2]:
                 ct_slice = self.ct_volume[:, :, slice_idx]
-                ct_slice = np.fliplr(ct_slice)
 
                 if vertebra_name:
                     mask_name = self.label_mapping.get(vertebra_name)
@@ -204,9 +208,8 @@ class VerificationViewer:
                 for mask in masks_to_use:
                     if len(mask.shape) == 3 and slice_idx < mask.shape[2]:
                         mask_slice = mask[:, :, slice_idx]
-                        mask_slice = np.rot90(mask_slice, k=-1)
-                        mask_slice = np.flipud(mask_slice)
-                        combined_mask = combined_mask | (mask_slice > 0)
+                        if mask_slice.shape == ct_slice.shape:
+                            combined_mask = combined_mask | (mask_slice > 0)
 
                 if np.any(combined_mask):
                     masked_hu_values = ct_slice[combined_mask]
@@ -235,10 +238,9 @@ class VerificationViewer:
         self.ax_axial.clear()
 
         ct_slice = self.ct_volume[:, :, slice_idx]
-        ct_display = self.window_ct(ct_slice)
-        ct_display = np.fliplr(ct_display)
+        ct_display = self._format_axial_slice(self.window_ct(ct_slice))
 
-        self.ax_axial.imshow(ct_display, cmap='gray', origin='lower', interpolation='bilinear',
+        self.ax_axial.imshow(ct_display, cmap='gray', origin='upper', interpolation='bilinear',
                             vmin=0.0, vmax=1.0)
 
         present_vertebrae = []
@@ -250,8 +252,7 @@ class VerificationViewer:
             else:
                 continue
 
-            mask_slice = np.rot90(mask_slice, k=-1)
-            mask_slice = np.flipud(mask_slice)
+            mask_slice = self._format_axial_slice(mask_slice)
 
             if np.any(mask_slice > 0):
                 if vertebra_name == 'vertebrae_body':
@@ -266,7 +267,7 @@ class VerificationViewer:
                 g = int(color[3:5], 16) / 255.0
                 b = int(color[5:7], 16) / 255.0
                 overlay[mask_slice > 0] = [r, g, b, 0.4]
-                self.ax_axial.imshow(overlay, origin='lower', interpolation='nearest')
+                self.ax_axial.imshow(overlay, origin='upper', interpolation='nearest')
                 self.ax_axial.contour(mask_slice, levels=[0.5], colors=[color], linewidths=2, alpha=0.8)
 
         if self.show_selected and slice_idx in self.selected_slices:
@@ -295,7 +296,7 @@ class VerificationViewer:
 
         sagittal_slice = self.calculate_sagittal_view(slice_idx)
         sagittal_display = self.window_ct(sagittal_slice)
-        sagittal_display = np.rot90(sagittal_display, k=-1)
+        sagittal_display = self._format_sagittal_slice(sagittal_display)
 
         self.ax_sagittal.imshow(sagittal_display, cmap='gray', origin='lower', interpolation='bilinear',
                                aspect='auto', vmin=0.0, vmax=1.0)
@@ -309,14 +310,13 @@ class VerificationViewer:
                 continue
 
             mask_sagittal = mask[slice_idx, :, :]
-            mask_sagittal = np.flipud(mask_sagittal)
             if mask_sagittal.shape != sagittal_slice.shape:
                 if mask_sagittal.size == sagittal_slice.size:
                     mask_sagittal = mask_sagittal.reshape(sagittal_slice.shape)
                 else:
                     continue
 
-            mask_sagittal = np.rot90(mask_sagittal, k=-1)
+            mask_sagittal = self._format_sagittal_slice(mask_sagittal)
 
             if np.any(mask_sagittal > 0):
                 if vertebra_name == 'vertebrae_body':
@@ -338,9 +338,9 @@ class VerificationViewer:
         if self.show_selected and self.selected_slices:
             for sel_slice in self.selected_slices:
                 if 0 <= sel_slice < self.axial_shape[2]:
-                    self.ax_sagittal.axvline(x=sel_slice, color='yellow', linewidth=2, alpha=0.7)
+                    self.ax_sagittal.axhline(y=sel_slice, color='yellow', linewidth=2, alpha=0.7)
 
-        title = f'Sagittal Slice {slice_idx} / {self.axial_shape[1] - 1}'
+        title = f'Sagittal Slice {slice_idx} / {self.axial_shape[0] - 1}'
         self.ax_sagittal.set_title(title, fontsize=14, weight='bold', color='black',
                                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         self.ax_sagittal.axis('off')
@@ -515,7 +515,7 @@ class VerificationViewer:
         self.slider_axial.label.set_weight('bold')
         self.slider_axial.on_changed(self.update_axial)
 
-        self.slider_sagittal = Slider(ax_slider_sagittal, 'Sagittal Slice', 0, self.axial_shape[1] - 1,
+        self.slider_sagittal = Slider(ax_slider_sagittal, 'Sagittal Slice', 0, self.axial_shape[0] - 1,
                                       valinit=self.sagittal_slice, valstep=1)
         self.slider_sagittal.label.set_fontsize(12)
         self.slider_sagittal.label.set_weight('bold')
@@ -663,21 +663,28 @@ def load_masks_for_verification(segmentation_dir: Path, ct_img: nib.Nifti1Image)
     masks = {}
     ct_shape = ct_img.shape[:3]
 
+    def mask_matches_ct(mask_img: nib.Nifti1Image) -> bool:
+        shape_match = mask_img.shape[:3] == ct_shape
+        affine_match = np.allclose(mask_img.affine, ct_img.affine, atol=1e-3)
+        return shape_match and affine_match
+
+    def mask_data_in_ct_space(mask_img: nib.Nifti1Image, name: str) -> np.ndarray:
+        if mask_matches_ct(mask_img):
+            return mask_img.get_fdata()
+        logger.info(
+            "Resampling %s mask from shape %s to CT shape %s",
+            name,
+            mask_img.shape[:3],
+            ct_shape,
+        )
+        return resample_from_to(mask_img, ct_img, order=0).get_fdata()
+
     for vertebra in LUMBAR_BODIES:
         mask_path = segmentation_dir / f"{vertebra}.nii.gz"
         if mask_path.exists():
             try:
                 mask_img = load_segmentation_mask(mask_path)
-                mask_shape = mask_img.shape[:3]
-
-                if mask_shape != ct_shape:
-                    logger.info(f"Resampling {vertebra} mask from {mask_shape} to {ct_shape}")
-                    resampled_mask_img = resample_from_to(mask_img, ct_img, order=0)
-                    mask_data = resampled_mask_img.get_fdata()
-                else:
-                    mask_data = mask_img.get_fdata()
-
-                masks[vertebra] = mask_data
+                masks[vertebra] = mask_data_in_ct_space(mask_img, vertebra)
             except Exception as e:
                 logger.warning(f"Failed to load mask {mask_path}: {e}")
 
@@ -686,13 +693,7 @@ def load_masks_for_verification(segmentation_dir: Path, ct_img: nib.Nifti1Image)
     if core_mask_path.exists():
         try:
             mask_img = load_segmentation_mask(core_mask_path)
-            mask_shape = mask_img.shape[:3]
-            if mask_shape != ct_shape:
-                resampled_mask_img = resample_from_to(mask_img, ct_img, order=0)
-                mask_data = resampled_mask_img.get_fdata()
-            else:
-                mask_data = mask_img.get_fdata()
-            masks[core_name] = mask_data
+            masks[core_name] = mask_data_in_ct_space(mask_img, core_name)
         except Exception as e:
             logger.warning(f"Failed to load core mask {core_mask_path}: {e}")
 
@@ -701,13 +702,7 @@ def load_masks_for_verification(segmentation_dir: Path, ct_img: nib.Nifti1Image)
         if vertebrae_body_path.exists():
             try:
                 mask_img = load_segmentation_mask(vertebrae_body_path)
-                mask_shape = mask_img.shape[:3]
-                if mask_shape != ct_shape:
-                    resampled_mask_img = resample_from_to(mask_img, ct_img, order=0)
-                    mask_data = resampled_mask_img.get_fdata()
-                else:
-                    mask_data = mask_img.get_fdata()
-                masks['vertebrae_body'] = mask_data
+                masks['vertebrae_body'] = mask_data_in_ct_space(mask_img, 'vertebrae_body')
             except Exception as e:
                 logger.warning(f"Failed to load vertebrae_body mask: {e}")
 
@@ -723,12 +718,13 @@ def load_ct_for_verification(
     suid = (series_instance_uid or "").strip()
     if suid:
         logger.info("Loading CT from DICOM (series %s)...", suid[:20] + ("…" if len(suid) > 20 else ""))
-        ct_img, _ = dicom_to_nifti(
-            dicom_folder, output_path=None, series_instance_uid=suid
-        )
     else:
         logger.info("Loading CT from DICOM series...")
-        ct_img = load_dicom_series(dicom_folder)
+    ct_img, _ = dicom_to_nifti(
+        dicom_folder,
+        output_path=None,
+        series_instance_uid=suid or None,
+    )
     ct_volume = ct_img.get_fdata()
     logger.info(f"Loaded CT volume with shape: {ct_volume.shape}")
     return ct_volume, ct_img

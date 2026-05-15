@@ -49,7 +49,8 @@ Usage::
     python build_batch_gui.py
     python build_batch_gui.py --clean
 
-Output goes under ``dist/`` — typically ``dist/oppoCT-Batch-QC-Package/`` with
+After a full build, pure workflow iterations can use ``python build_batch_gui_exe_only.py``
+(see that script’s docstring). Output goes under ``dist/`` — typically ``dist/oppoCT-Batch-QC-Package/`` with
 ``oppoCT-Batch-QC.exe`` inside.
 """
 

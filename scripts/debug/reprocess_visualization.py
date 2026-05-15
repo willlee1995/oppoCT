@@ -5,8 +5,9 @@ import json
 import shutil
 import sys
 
-# Add src to path
-sys.path.append('src')
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from src.dicom_processor import dicom_to_nifti
 from src.csv_exporter import export_patient_to_csv

@@ -1,9 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import argparse
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
+# Trailing arguments after ``pyinstaller ... --`` are forwarded here; PyInstaller sets
+# ``sys.argv`` to ``[spec_path, ...spec_args]`` (the ``--`` itself is not included).
+_spec_argv = sys.argv[1:]
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument(
+    "--exe-only",
+    action="store_true",
+    help="Build the EXE (PKG/PYZ) only; skip COLLECT for pairing with an existing onedir package.",
+)
+_spec_opts, _spec_unknown = _parser.parse_known_args(_spec_argv)
+exe_only = _spec_opts.exe_only
 
 block_cipher = None
 project_root = Path.cwd()
@@ -87,13 +100,14 @@ exe = EXE(
     entitlements_file=None,
 )
 
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name="oppoCT-Batch-QC-Package",
-)
+if not exe_only:
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=False,
+        upx=True,
+        upx_exclude=[],
+        name="oppoCT-Batch-QC-Package",
+    )
