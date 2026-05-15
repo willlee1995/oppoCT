@@ -87,6 +87,16 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    license_config = project_root / "totalsegmentator_home" / "config.json"
+    if not license_config.is_file():
+        print(
+            "WARNING: totalsegmentator_home/config.json is missing. "
+            "vertebrae_body (commercial) will fail without a license. Run:\n"
+            "  python scripts/setup_totalseg_license.py -l aca_...\n"
+            "  or: totalseg_set_license -l aca_... then python scripts/setup_totalseg_license.py\n",
+            file=sys.stderr,
+        )
+
     # Use sys.executable so the build uses the active venv / interpreter, not a random PyInstaller on PATH.
     cmd = [sys.executable, "-m", "PyInstaller", str(spec_path), "-y"]
     if args.clean:
@@ -101,7 +111,14 @@ def main() -> int:
             "If pip is missing: python -m ensurepip --upgrade",
             file=sys.stderr,
         )
-    return result.returncode
+        return result.returncode
+
+    from bundle_build_guard import record_batch_gui_bundle_fingerprint
+
+    package_dir = project_root / "dist" / "oppoCT-Batch-QC-Package"
+    if package_dir.is_dir():
+        record_batch_gui_bundle_fingerprint(package_dir)
+    return 0
 
 
 if __name__ == "__main__":

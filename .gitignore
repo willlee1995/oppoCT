@@ -12,6 +12,7 @@ result.csv
 /dist
 /build
 /totalsegmentator_weights
+/totalsegmentator_home/config.json
 /venv
 /weight_download_work
 /weight_download_work.zip

@@ -33,14 +33,13 @@ import matplotlib.pyplot as plt
 import nibabel as nib
 import numpy as np
 import pandas as pd
-from matplotlib.patches import Rectangle, Patch
+from matplotlib.patches import Patch
 from matplotlib.widgets import Button, Slider
 from nibabel.processing import resample_from_to
 
 from src.dicom_processor import dicom_to_nifti
 from src.patient_manager import get_patient_metadata, create_patient_output_dir
 from src.pipeline import find_patient_folders
-from src.visualizer import find_representative_slices
 from verify_segmentation import load_segmentation_mask
 
 logger.info("All imports complete.")
@@ -114,14 +113,6 @@ class VerificationViewer:
         self.axial_slice = ct_volume.shape[2] // 2  # Depth axis
         self.sagittal_slice = ct_volume.shape[0] // 2  # Left-right axis
 
-        # Selected slices for HU calculation
-        try:
-            self.selected_slices = find_representative_slices(ct_volume, masks, num_slices=3)
-            logger.info(f"Auto-selected slices: {self.selected_slices}")
-        except Exception as e:
-            logger.warning(f"Failed to auto-select slices: {e}")
-            self.selected_slices: List[int] = []
-
         # Case status
         self.is_successful: Optional[bool] = None
 
@@ -131,9 +122,6 @@ class VerificationViewer:
         self.ax_sagittal = None
         self.slider_axial = None
         self.slider_sagittal = None
-
-        # Display state
-        self.show_selected = True
 
         # Label mapping
         self.label_mapping = {v.replace('vertebrae_', '').replace('_body', ''): v for v in LUMBAR_BODIES}
@@ -270,18 +258,10 @@ class VerificationViewer:
                 self.ax_axial.imshow(overlay, origin='upper', interpolation='nearest')
                 self.ax_axial.contour(mask_slice, levels=[0.5], colors=[color], linewidths=2, alpha=0.8)
 
-        if self.show_selected and slice_idx in self.selected_slices:
-            rect = Rectangle((0, 0), ct_display.shape[1]-1, ct_display.shape[0]-1,
-                           linewidth=3, edgecolor='yellow', facecolor='none')
-            self.ax_axial.add_patch(rect)
-
         title = f'Axial Slice {slice_idx} / {self.axial_shape[2] - 1}'
         if present_vertebrae:
             title += f' - {", ".join(present_vertebrae)}'
-        if slice_idx in self.selected_slices:
-            title += ' [SELECTED]'
-        title_color = 'darkorange' if slice_idx in self.selected_slices else 'black'
-        self.ax_axial.set_title(title, fontsize=14, weight='bold', color=title_color,
+        self.ax_axial.set_title(title, fontsize=14, weight='bold', color='black',
                                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         self.ax_axial.axis('off')
 
@@ -335,38 +315,11 @@ class VerificationViewer:
         if 0 <= self.axial_slice < self.axial_shape[2]:
             self.ax_sagittal.axhline(y=self.axial_slice, color='cyan', linewidth=3, alpha=0.9, linestyle='--')
 
-        if self.show_selected and self.selected_slices:
-            for sel_slice in self.selected_slices:
-                if 0 <= sel_slice < self.axial_shape[2]:
-                    self.ax_sagittal.axhline(y=sel_slice, color='yellow', linewidth=2, alpha=0.7)
-
         title = f'Sagittal Slice {slice_idx} / {self.axial_shape[0] - 1}'
         self.ax_sagittal.set_title(title, fontsize=14, weight='bold', color='black',
                                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         self.ax_sagittal.axis('off')
         self.fig.canvas.draw_idle()
-
-    def toggle_slice_selection(self, event):
-        """Toggle selection of current axial slice."""
-        if self.axial_slice in self.selected_slices:
-            self.selected_slices.remove(self.axial_slice)
-        else:
-            self.selected_slices.append(self.axial_slice)
-            self.selected_slices.sort()
-        self.update_axial(self.axial_slice)
-        self.update_sagittal(self.sagittal_slice)
-        self.update_info_text()
-
-    def auto_select_slices(self, event):
-        """Auto-select representative slices."""
-        try:
-            self.selected_slices = find_representative_slices(self.ct_volume, self.masks, num_slices=3)
-            logger.info(f"Auto-selected slices: {self.selected_slices}")
-            self.update_axial(self.axial_slice)
-            self.update_sagittal(self.sagittal_slice)
-            self.update_info_text()
-        except Exception as e:
-            logger.error(f"Error auto-selecting slices: {e}")
 
     def mark_success(self, event):
         """Mark case as successful."""
@@ -428,8 +381,6 @@ class VerificationViewer:
         """Update information text display."""
         if hasattr(self, 'info_text'):
             status = "SUCCESS" if self.is_successful else ("FAILED" if self.is_successful is False else "NOT MARKED")
-            selected_str = ', '.join(map(str, self.selected_slices)) if self.selected_slices else 'None'
-            avg_hu = self.calculate_average_hu(self.selected_slices) if self.selected_slices else 0.0
 
             l1_body_hu = self.calculate_volumetric_hu('vertebrae_L1_body')
             l1_core_hu = self.calculate_volumetric_hu('vertebrae_L1_body_trabecular_core')
@@ -437,8 +388,6 @@ class VerificationViewer:
             info = f"Patient ID: {self.patient_id}\n"
             info += f"Exam Date: {self.exam_date or 'N/A'}\n"
             info += f"Status: {status}\n"
-            info += f"Selected Slices: {selected_str}\n"
-            info += f"Average HU: {avg_hu:.1f}\n"
 
             if l1_body_hu != 0 or l1_core_hu != 0:
                 info += f"L1 Body HU: {l1_body_hu:.1f}\n"
@@ -535,17 +484,7 @@ class VerificationViewer:
         btn_fail.label.set_weight('bold')
         btn_fail.on_clicked(self.mark_fail)
 
-        btn_select_slice = Button(plt.axes([0.36, btn_y, btn_width, btn_height]), 'Toggle Slice')
-        btn_select_slice.label.set_fontsize(11)
-        btn_select_slice.label.set_weight('bold')
-        btn_select_slice.on_clicked(self.toggle_slice_selection)
-
-        btn_auto_select = Button(plt.axes([0.49, btn_y, btn_width, btn_height]), 'Auto Select')
-        btn_auto_select.label.set_fontsize(11)
-        btn_auto_select.label.set_weight('bold')
-        btn_auto_select.on_clicked(self.auto_select_slices)
-
-        btn_done = Button(plt.axes([0.62, btn_y, btn_width * 1.2, btn_height]), 'Done (Save & Next)')
+        btn_done = Button(plt.axes([0.36, btn_y, btn_width * 1.2, btn_height]), 'Done (Save & Next)')
         btn_done.label.set_fontsize(11)
         btn_done.label.set_weight('bold')
         btn_done.on_clicked(lambda x: plt.close(self.fig))
@@ -567,9 +506,8 @@ class VerificationViewer:
         instructions = (
             "Instructions:\n"
             "1. Navigate slices using sliders\n"
-            "2. Click 'Toggle Slice' to select/deselect current axial slice\n"
-            "3. Mark case as Success or Fail\n"
-            "4. Click 'Done' to save and proceed to next case"
+            "2. Mark case as Success or Fail\n"
+            "3. Click 'Done' to save and proceed to next case"
         )
         ax_controls.text(0.05, 0.7, instructions, fontsize=12, verticalalignment='top',
                          family='monospace', transform=ax_controls.transAxes,
@@ -627,8 +565,8 @@ class VerificationViewer:
             'patient_id': self.patient_id,
             'exam_date': self.exam_date,
             'is_successful': self.is_successful,
-            'selected_slices': self.selected_slices.copy(),
-            'average_hu': self.calculate_average_hu(self.selected_slices),
+            'selected_slices': [],
+            'average_hu': None,
             'label_mapping': self.label_mapping.copy(),
             'vertebra_hu': {
                 label: self.calculate_volumetric_hu(label)

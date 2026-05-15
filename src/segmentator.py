@@ -4,6 +4,7 @@ Segmentation Module
 Interfaces with TotalSegmentator Python API to segment lumbar vertebrae.
 """
 
+import gc
 import logging
 import platform
 from pathlib import Path
@@ -17,6 +18,9 @@ from .totalseg_local_weights import (
     enforce_local_weights_if_configured,
     skip_vertebrae_body_seg,
 )
+from .totalseg_runtime import apply_totalseg_runtime_paths
+
+apply_totalseg_runtime_paths()
 
 try:
     from totalsegmentator.python_api import totalsegmentator
@@ -37,6 +41,14 @@ LUMBAR_VERTEBRAE = [
 ]
 
 
+def _load_nifti(path: Path) -> nib.Nifti1Image:
+    """Load NIfTI without mmap so Windows does not keep volume files locked."""
+    try:
+        return nib.load(str(path), mmap=False)
+    except TypeError:
+        return nib.load(str(path))
+
+
 def generate_trabecular_core(output_dir: Path, verbose: bool = True) -> None:
     """
     Generate trabecular core mask for L1 body by eroding 2.5mm.
@@ -52,10 +64,11 @@ def generate_trabecular_core(output_dir: Path, verbose: bool = True) -> None:
         return
 
     try:
-        img = nib.load(str(l1_body_path))
+        img = _load_nifti(l1_body_path)
         data = img.get_fdata()
         affine = img.affine
         header = img.header
+        del img
 
         # Get voxel spacing to calculate erosion distance in pixels
         zooms = header.get_zooms()
@@ -213,16 +226,18 @@ def segment_lumbar_vertebrae(
              logging.warning(f"vertebrae_body.nii.gz not found at {body_mask_path}")
 
         try:
-            body_img = nib.load(str(body_mask_path))
+            body_img = _load_nifti(body_mask_path)
             body_data = body_img.get_fdata() > 0
-            affine = body_img.affine
-            header = body_img.header
+            affine = body_img.affine.copy()
+            header = body_img.header.copy()
+            del body_img
 
             for vertebra in LUMBAR_VERTEBRAE:
                 vert_path = output_dir / f"{vertebra}.nii.gz"
                 if vert_path.exists():
-                    vert_img = nib.load(str(vert_path))
+                    vert_img = _load_nifti(vert_path)
                     vert_data = vert_img.get_fdata() > 0
+                    del vert_img
 
                     # Intersect
                     intersect_data = np.logical_and(body_data, vert_data).astype(np.uint8)
@@ -248,6 +263,8 @@ def segment_lumbar_vertebrae(
         # Generate trabecular core for L1
         generate_trabecular_core(output_dir, verbose)
 
+        # Ensure file handles from nibabel are released before Windows unlinks in cleanup.
+        gc.collect()
         # Clean up any non-vertebrae files that might exist
         _cleanup_non_vertebrae_files(output_dir, verbose)
 
@@ -326,8 +343,9 @@ def verify_segmentation_output(output_dir: Path) -> List[str]:
         if mask_path.exists():
             try:
                 # Check if mask is non-empty
-                mask_nifti = nib.load(str(mask_path))
+                mask_nifti = _load_nifti(mask_path)
                 mask = mask_nifti.get_fdata()
+                del mask_nifti
                 if np.sum(mask > 0) > 0:
                     found_vertebrae.append(vertebra)
             except Exception as e:

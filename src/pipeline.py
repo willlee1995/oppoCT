@@ -5,6 +5,7 @@ Orchestrates batch processing of multiple patients through the entire workflow:
 DICOM -> NIfTI -> Segmentation -> Statistics -> Visualization -> CSV Export
 """
 
+import gc
 import logging
 import os
 import shutil
@@ -96,13 +97,18 @@ def process_single_patient(
         )
         if extracted_pid != patient_id:
             logging.warning(f"Patient ID mismatch: extracted {extracted_pid}, using {patient_id}")
-        
-        # Get voxel spacing for volume calculation
+
+        # Get voxel spacing for volume calculation (read from header before releasing image)
         voxel_spacing = None
         if hasattr(nifti_img, 'header'):
             spacing = nifti_img.header.get_zooms()
             if len(spacing) >= 3:
                 voxel_spacing = [float(spacing[0]), float(spacing[1]), float(spacing[2])]
+
+        # Drop the in-memory image before downstream tools open the same NIfTI on Windows
+        # (avoids stray handles / mmap confusion with TotalSegmentator and nibabel).
+        del nifti_img
+        gc.collect()
         
         # Step 4: Segment lumbar vertebrae
         # We process directly from DICOM to ensure unmodified TotalSegmentator results.

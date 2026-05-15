@@ -20,6 +20,7 @@ matplotlib.use("TkAgg", force=True)
 import csv
 import json
 import logging
+import os
 import re
 import sys
 import tempfile
@@ -160,6 +161,127 @@ class _GuiLogHandler(logging.Handler):
             self.handleError(record)
 
 
+# Workflow 3 (batch segmentation) log panel: keep a small window in Tk, spill the rest to disk.
+W2_LOG_MAX_VISIBLE_LINES = 1200
+W2_LOG_TRIM_LINES = 500
+W2_LOG_MAX_ARCHIVE_FILES = 30
+
+
+def _w2_default_log_dir(csv_path: Optional[Path] = None) -> Path:
+    if csv_path is not None:
+        parent = csv_path.parent
+        if parent.is_dir():
+            return parent / "oppoCT_batch_logs"
+    local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or tempfile.gettempdir()
+    return Path(local) / "oppoCT" / "batch_segment_logs"
+
+
+def _w2_prune_old_logs(log_dir: Path, keep: int = W2_LOG_MAX_ARCHIVE_FILES) -> None:
+    try:
+        files = sorted(
+            log_dir.glob("workflow3_segment*.log*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in files[keep:]:
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+class _WorkflowGuiLog:
+    """Bounded Tk Text log with rotation of older lines into session files on disk."""
+
+    def __init__(self, text_widget: tk.Text):
+        self._text = text_widget
+        self._log_dir: Optional[Path] = None
+        self._session_path: Optional[Path] = None
+        self._rotate_notice_shown = False
+
+    @property
+    def session_path(self) -> Optional[Path]:
+        return self._session_path
+
+    def start_session(self, csv_path: Path) -> Path:
+        self._log_dir = _w2_default_log_dir(csv_path)
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        _w2_prune_old_logs(self._log_dir)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._session_path = self._log_dir / f"workflow3_segment_{stamp}.log"
+        self._rotate_notice_shown = False
+        header = (
+            f"# oppoCT workflow 3 batch segmentation log\n"
+            f"# started: {datetime.now().isoformat(timespec='seconds')}\n"
+            f"# csv: {csv_path}\n\n"
+        )
+        try:
+            self._session_path.write_text(header, encoding="utf-8")
+        except OSError:
+            pass
+        return self._session_path
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        self._text.config(state=tk.NORMAL)
+        self._text.insert(tk.END, text)
+        self._text.see(tk.END)
+        self._maybe_rotate()
+        self._text.config(state=tk.DISABLED)
+
+    def clear_widget(self) -> None:
+        self._text.config(state=tk.NORMAL)
+        self._text.delete("1.0", tk.END)
+        self._text.config(state=tk.DISABLED)
+
+    def _maybe_rotate(self) -> None:
+        try:
+            last_line = int(str(self._text.index("end-1c")).split(".", maxsplit=1)[0])
+        except (tk.TclError, ValueError, IndexError):
+            return
+        if last_line <= W2_LOG_MAX_VISIBLE_LINES:
+            return
+        trim_to = min(W2_LOG_TRIM_LINES, max(1, last_line - W2_LOG_MAX_VISIBLE_LINES))
+        end_index = f"{trim_to}.0"
+        try:
+            chunk = self._text.get("1.0", end_index)
+        except tk.TclError:
+            return
+        if not chunk:
+            return
+        self._dump_to_disk(chunk)
+        try:
+            self._text.delete("1.0", end_index)
+        except tk.TclError:
+            return
+        if not self._rotate_notice_shown:
+            self._rotate_notice_shown = True
+            notice = (
+                f"[{datetime.now().strftime('%H:%M:%S')}] "
+                f"Older log lines saved to:\n  {self._session_path}\n"
+            )
+            try:
+                self._text.insert("1.0", notice)
+            except tk.TclError:
+                pass
+
+    def _dump_to_disk(self, chunk: str) -> None:
+        if self._session_path is None:
+            return
+        marker = f"\n--- GUI log rotation {datetime.now().isoformat(timespec='seconds')} ---\n"
+        try:
+            with self._session_path.open("a", encoding="utf-8", errors="replace") as fh:
+                fh.write(marker)
+                fh.write(chunk)
+                if not chunk.endswith("\n"):
+                    fh.write("\n")
+        except OSError:
+            pass
+
+
 CSV_COLUMNS = [
     "case_id",
     "patient_id",
@@ -206,12 +328,27 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _format_pytorch_import_error(exc: BaseException) -> str:
+    msg = str(exc)
+    if sys.platform == "win32" and (
+        getattr(exc, "winerror", None) == 1455
+        or "1455" in msg
+        or "paging file" in msg.lower()
+    ):
+        return (
+            f"Could not load PyTorch (Windows virtual memory limit):\n{exc}\n\n"
+            "Close other heavy applications, increase the Windows paging file "
+            "(System → Advanced → Performance → Virtual memory), or reboot and retry."
+        )
+    return f"Could not import torch:\n{exc}"
+
+
 def _pytorch_cuda_summary() -> str:
     """Human-readable PyTorch / CUDA status for the batch GUI (may import torch)."""
     try:
         import torch
     except Exception as exc:
-        return f"Could not import torch:\n{exc}"
+        return _format_pytorch_import_error(exc)
     lines: List[str] = [f"PyTorch {torch.__version__}"]
     compiled = getattr(torch.version, "cuda", None)
     if compiled not in (None, "0.0"):
@@ -308,6 +445,7 @@ def read_csv_rows(csv_path: Path) -> List[Dict[str, str]]:
 
 
 def write_csv_rows(csv_path: Path, rows: List[Dict[str, str]]) -> None:
+    """Write batch CSV. Uses a temp file + replace and retries on Windows file locks."""
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(CSV_COLUMNS)
     for row in rows:
@@ -315,11 +453,35 @@ def write_csv_rows(csv_path: Path, rows: List[Dict[str, str]]) -> None:
             if key not in fieldnames:
                 fieldnames.append(key)
 
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
+    def _is_file_in_use_error(exc: BaseException) -> bool:
+        if isinstance(exc, PermissionError):
+            return True
+        if isinstance(exc, OSError):
+            if getattr(exc, "winerror", None) == 32:
+                return True
+            return exc.errno == 13
+        return False
+
+    tmp_path = csv_path.with_name(f"{csv_path.stem}_{uuid.uuid4().hex}.tmp.csv")
+    for attempt in range(24):
+        try:
+            with tmp_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({key: row.get(key, "") for key in fieldnames})
+            os.replace(tmp_path, csv_path)
+            return
+        except (PermissionError, OSError) as e:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            if not _is_file_in_use_error(e) or attempt == 23:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+    raise RuntimeError(f"Failed to write CSV after retries: {csv_path}")
 
 
 def build_one_case_row(
@@ -384,6 +546,23 @@ def build_case_rows(input_path: Path, output_base_dir: Path) -> List[Dict[str, s
     return rows
 
 
+def segmentation_output_paths_for_row(
+    row: Dict[str, str], output_base_dir_override: Optional[Path]
+) -> Tuple[Path, Path, Path, Path]:
+    """
+    Resolve output paths for a CSV row the same way batch segmentation does.
+
+    Returns ``(dicom_folder, output_base_dir, patient_output_dir, segmentation_dir)``.
+    """
+    dicom_folder = Path(row["dicom_folder"])
+    output_base_dir = output_base_dir_override or Path(row.get("output_base_dir") or ".")
+    study_id = row.get("study_id") or dicom_folder.name
+    patient_id = row.get("patient_id") or dicom_folder.name
+    patient_output_dir = expected_patient_output_dir(output_base_dir, patient_id, study_id)
+    segmentation_dir = patient_output_dir / "segmentations"
+    return dicom_folder, output_base_dir, patient_output_dir, segmentation_dir
+
+
 def process_segmentation_row(
     row: Dict[str, str],
     output_base_dir_override: Optional[Path],
@@ -391,12 +570,9 @@ def process_segmentation_row(
     fast_segmentation: bool,
     device: str,
 ) -> Dict[str, str]:
-    dicom_folder = Path(row["dicom_folder"])
-    output_base_dir = output_base_dir_override or Path(row.get("output_base_dir") or ".")
-    study_id = row.get("study_id") or dicom_folder.name
-    patient_id = row.get("patient_id") or dicom_folder.name
-    patient_output_dir = expected_patient_output_dir(output_base_dir, patient_id, study_id)
-    segmentation_dir = patient_output_dir / "segmentations"
+    dicom_folder, output_base_dir, patient_output_dir, segmentation_dir = segmentation_output_paths_for_row(
+        row, output_base_dir_override
+    )
 
     row["output_base_dir"] = str(output_base_dir)
     row["patient_output_dir"] = str(patient_output_dir)
@@ -424,7 +600,7 @@ def process_segmentation_row(
         fast_segmentation=fast_segmentation,
         device=device,
         keep_temp_files=True,
-        forced_study_id=study_id,
+        forced_study_id=row.get("study_id") or dicom_folder.name,
         series_instance_uid=series_uid,
     )
 
@@ -483,6 +659,7 @@ class BatchVerificationApp:
         self.sp_rows: List[Dict[str, str]] = []
         self.sp_series_items: List[Dict[str, object]] = []
         self._w2_cuda_check_running = False
+        self._w2_gui_log = None  # set in _create_segmentation_frame
         self.w3_csv_path: Optional[Path] = None
         self.w3_rows: List[Dict[str, str]] = []
         self.w3_display_indices: List[int] = []
@@ -1113,7 +1290,8 @@ class BatchVerificationApp:
         )
         ttk.Label(
             config,
-            text="Only CSV rows with a selected series (series_instance_uid from workflow 2) are segmented.",
+            text="Only rows with series_instance_uid (workflow 2) and without existing segmentation "
+            "outputs under the output path are processed.",
             wraplength=780,
             justify=tk.LEFT,
         ).grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=(6, 0))
@@ -1145,6 +1323,19 @@ class BatchVerificationApp:
 
         self.w2_log_text = tk.Text(progress, height=18, state=tk.DISABLED)
         self.w2_log_text.pack(fill="both", expand=True)
+        self._w2_gui_log = _WorkflowGuiLog(self.w2_log_text)
+
+        self.w2_log_path_var = tk.StringVar(
+            value="Full session log is written beside the batch CSV (oppoCT_batch_logs/) when segmentation runs."
+        )
+        ttk.Label(
+            progress,
+            textvariable=self.w2_log_path_var,
+            wraplength=900,
+            justify=tk.LEFT,
+            font=("Helvetica", 9),
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Button(progress, text="Open Log Folder", command=self.w2_open_log_folder).pack(anchor="w", pady=(2, 0))
 
     def w2_browse_csv(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
@@ -1157,22 +1348,39 @@ class BatchVerificationApp:
             self.w2_output_override_var.set(folder)
 
     def _w2_append_raw(self, text: str) -> None:
-        if not text:
+        if not text or self._w2_gui_log is None:
             return
-        self.w2_log_text.config(state=tk.NORMAL)
-        self.w2_log_text.insert(tk.END, text)
-        self.w2_log_text.see(tk.END)
-        # Very long logs slow Text widget layout; trim from the top occasionally.
-        try:
-            last_line = int(str(self.w2_log_text.index("end-1c")).split(".", maxsplit=1)[0])
-            if last_line > 2800:
-                self.w2_log_text.delete("1.0", "800.0")
-        except (tk.TclError, ValueError, IndexError):
-            pass
-        self.w2_log_text.config(state=tk.DISABLED)
+        self._w2_gui_log.append(text)
 
     def w2_log(self, message: str) -> None:
         self._w2_append_raw(message + "\n")
+
+    def w2_open_log_folder(self) -> None:
+        log_dir: Optional[Path] = None
+        if self._w2_gui_log is not None and self._w2_gui_log.session_path is not None:
+            log_dir = self._w2_gui_log.session_path.parent
+        else:
+            csv_text = self.w2_csv_var.get().strip()
+            if csv_text:
+                log_dir = _w2_default_log_dir(Path(csv_text))
+        if log_dir is None:
+            messagebox.showinfo("Log folder", "Start batch segmentation or choose a batch CSV first.")
+            return
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Log folder", f"Could not create log folder:\n{log_dir}\n\n{exc}")
+            return
+        if sys.platform == "win32":
+            os.startfile(str(log_dir))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            import subprocess
+
+            subprocess.Popen(["open", str(log_dir)])
+        else:
+            import subprocess
+
+            subprocess.Popen(["xdg-open", str(log_dir)])
 
     def w2_check_cuda(self) -> None:
         """Run torch import / CUDA probes off the Tk main thread (can take several seconds)."""
@@ -1201,7 +1409,7 @@ class BatchVerificationApp:
             try:
                 import torch
             except Exception as exc:
-                messagebox.showerror("PyTorch", f"Cannot import torch:\n{exc}")
+                messagebox.showerror("PyTorch", _format_pytorch_import_error(exc))
                 return
             if not torch.cuda.is_available():
                 proceed = messagebox.askyesno(
@@ -1218,9 +1426,11 @@ class BatchVerificationApp:
         override_path = Path(output_override) if output_override else None
         self.w2_start_button.config(state=tk.DISABLED)
         self.w2_progress_var.set(0)
-        self.w2_log_text.config(state=tk.NORMAL)
-        self.w2_log_text.delete("1.0", tk.END)
-        self.w2_log_text.config(state=tk.DISABLED)
+        if self._w2_gui_log is not None:
+            session_log = self._w2_gui_log.start_session(csv_path)
+            self._w2_gui_log.clear_widget()
+            self.w2_log_path_var.set(f"Session log (older lines spill here): {session_log}")
+            self.w2_log(f"Logging to {session_log}")
 
         threading.Thread(
             target=self._run_segmentation_thread,
@@ -1256,6 +1466,7 @@ class BatchVerificationApp:
 
             pending: List[Tuple[int, Dict[str, str]]] = []
             skipped_no_series = 0
+            skipped_seg_done = 0
             for idx, row in enumerate(rows):
                 status = row.get("status", "pending").lower()
                 if not (status == "pending" or (retry_failed and status == "failed_pipeline")):
@@ -1263,10 +1474,18 @@ class BatchVerificationApp:
                 if not (row.get("series_instance_uid") or "").strip():
                     skipped_no_series += 1
                     continue
+                _, _ob, _pod, segmentation_dir = segmentation_output_paths_for_row(row, output_override)
+                if check_segmentations_exist(segmentation_dir):
+                    skipped_seg_done += 1
+                    continue
                 pending.append((idx, row))
 
             total = len(pending)
-            self.root.after(0, self.w2_log, f"Found {total} case(s) to segment (series selected).")
+            self.root.after(
+                0,
+                self.w2_log,
+                f"Found {total} case(s) to segment (series selected, segmentation outputs not present yet).",
+            )
             if skipped_no_series:
                 self.root.after(
                     0,
@@ -1274,11 +1493,54 @@ class BatchVerificationApp:
                     f"Skipping {skipped_no_series} pending row(s) with no series_instance_uid "
                     "(assign in workflow 2).",
                 )
-            if total == 0 and skipped_no_series:
+            if skipped_seg_done:
                 self.root.after(
                     0,
                     self.w2_log,
-                    "Nothing to run: pending rows need a series chosen in workflow 2.",
+                    f"Skipping {skipped_seg_done} row(s) that already have segmentations on disk.",
+                )
+            if total == 0:
+                if skipped_no_series or skipped_seg_done:
+                    self.root.after(
+                        0,
+                        self.w2_log,
+                        "Nothing to run: need a series in workflow 2 and/or outputs are already present.",
+                    )
+
+            csv_dirty = False
+            sync_count = 0
+            for idx, row in enumerate(rows):
+                st = row.get("status", "pending").lower()
+                if not (st == "pending" or (retry_failed and st == "failed_pipeline")):
+                    continue
+                if not (row.get("series_instance_uid") or "").strip():
+                    continue
+                _, _ob, _pod, seg_dir = segmentation_output_paths_for_row(row, output_override)
+                if not check_segmentations_exist(seg_dir):
+                    continue
+                start_sync = time.perf_counter()
+                rows[idx]["output_base_dir"] = str(_ob)
+                rows[idx]["patient_output_dir"] = str(_pod)
+                rows[idx]["segmentation_dir"] = str(seg_dir)
+                rows[idx]["status"] = "not checked"
+                rows[idx]["error"] = ""
+                rows[idx]["was_skipped"] = "true"
+                rows[idx]["segmentation_duration_seconds"] = f"{time.perf_counter() - start_sync:.2f}"
+                rows[idx]["updated_at"] = _now()
+                csv_dirty = True
+                sync_count += 1
+            if csv_dirty:
+                try:
+                    write_csv_rows(csv_path, rows)
+                except Exception as exc:
+                    logger.exception("Failed to sync CSV for existing segmentations")
+                    self.root.after(0, lambda: messagebox.showerror("Save Failed", str(exc)))
+                    self.root.after(0, self.w2_start_button.config, {"state": tk.NORMAL})
+                    return
+                self.root.after(
+                    0,
+                    self.w2_log,
+                    f"Updated {sync_count} CSV row(s) to not checked (segmentation files already on disk).",
                 )
 
             temp_dir = Path(tempfile.mkdtemp(prefix="oppoct_batch_gui_"))
@@ -1327,7 +1589,13 @@ class BatchVerificationApp:
 
         self.root.after(0, self.w2_start_button.config, {"state": tk.NORMAL})
         if show_completion_dialog:
-            self.root.after(0, lambda: messagebox.showinfo("Done", "Batch segmentation complete."))
+            log_hint = ""
+            if self._w2_gui_log is not None and self._w2_gui_log.session_path is not None:
+                log_hint = f"\n\nFull log:\n{self._w2_gui_log.session_path}"
+            self.root.after(
+                0,
+                lambda: messagebox.showinfo("Done", f"Batch segmentation complete.{log_hint}"),
+            )
 
     def _create_qc_frame(self) -> None:
         frame = ttk.Frame(self.root, padding=10)
@@ -1461,8 +1729,6 @@ class BatchVerificationApp:
             f"Series description: {row.get('series_description', '')}",
             f"DICOM Folder: {row.get('dicom_folder', '')}",
             f"Segmentation Dir: {row.get('segmentation_dir', '')}",
-            f"Selected Slices: {row.get('selected_slices', '')}",
-            f"Average HU: {row.get('average_hu_all', '')}",
             f"L1 Trabecular Core HU: {row.get('l1_trabecular_core_hu', '')}",
             f"Error: {row.get('error', '')}",
         ]

@@ -50,6 +50,10 @@ def main() -> None:
     weights_dir.mkdir(parents=True, exist_ok=True)
     os.environ["TOTALSEG_WEIGHTS_PATH"] = str(weights_dir)
 
+    from src.totalseg_runtime import apply_totalseg_runtime_paths
+
+    apply_totalseg_runtime_paths()
+
     from totalsegmentator.python_api import totalsegmentator
 
     work_dir = Path("weight_download_work")

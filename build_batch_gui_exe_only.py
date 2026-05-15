@@ -9,7 +9,13 @@ skips ``COLLECT``, then copies the executable from the spec workpath
 (``build/build_windows_batch_gui/``) into the existing package folder.
 
 Use a **full** build when native deps, datas, weights, hidden imports, or
-Python/PyInstaller versions change — otherwise the frozen app can break at runtime.
+Python/PyInstaller versions change — otherwise the frozen app can break at runtime
+(for example ``ImportError`` / missing symbols from ``numpy`` when the new exe’s
+embedded code does not match the old ``numpy`` binaries left in ``_internal``).
+
+This script compares your current venv to ``.oppoct_batch_bundle_fingerprint.json``
+written by the last ``build_batch_gui.py``. Use ``--force`` to skip that check
+(not recommended).
 
 Environment: same as ``build_batch_gui.py`` (project venv, PyInstaller installed).
 """
@@ -36,6 +42,11 @@ def main() -> int:
         action="store_true",
         help="Pass PyInstaller --clean (wipe cache before build).",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip fingerprint check (risk of numpy/torch ImportError if _internal is stale).",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent
@@ -58,6 +69,20 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+
+    if not args.force:
+        from bundle_build_guard import verify_batch_gui_bundle_fingerprint
+
+        ok, messages = verify_batch_gui_bundle_fingerprint(package_dir)
+        if not ok:
+            for line in messages:
+                print(f"ERROR: {line}", file=sys.stderr)
+            print(
+                "If you intentionally want to refresh only Python sources and _internal "
+                "is known good, retry with --force.",
+                file=sys.stderr,
+            )
+            return 1
 
     cmd = [
         sys.executable,

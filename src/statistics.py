@@ -90,9 +90,14 @@ def calculate_patient_statistics(
     Returns:
         Dictionary with patient_id and statistics for each vertebra
     """
-    # Load CT image
-    ct_nifti = nib.load(str(ct_image_path))
+    # Load CT image (no mmap: avoids Windows locking the temp NIfTI during the pipeline)
+    try:
+        ct_nifti = nib.load(str(ct_image_path), mmap=False)
+    except TypeError:
+        ct_nifti = nib.load(str(ct_image_path))
+    ct_spacing = tuple(float(x) for x in ct_nifti.header.get_zooms()[:3])
     ct_image = ct_nifti.get_fdata()
+    del ct_nifti
 
     # Calculate voxel volume if spacing provided
     voxel_volume_mm3 = None
@@ -114,7 +119,10 @@ def calculate_patient_statistics(
 
         if mask_path.exists():
             # Load mask
-            mask_nifti = nib.load(str(mask_path))
+            try:
+                mask_nifti = nib.load(str(mask_path), mmap=False)
+            except TypeError:
+                mask_nifti = nib.load(str(mask_path))
             mask = mask_nifti.get_fdata()
 
             # Ensure mask and CT have same shape
@@ -126,7 +134,6 @@ def calculate_patient_statistics(
 
                     # Get spacings
                     mask_spacing = mask_nifti.header.get_zooms()[:3]
-                    ct_spacing = ct_nifti.header.get_zooms()[:3]
 
                     # Calculate resampling factors (CT to mask space)
                     zoom_factors = [c / m for c, m in zip(ct_spacing, mask_spacing)]
@@ -176,6 +183,8 @@ def calculate_patient_statistics(
             else:
                 ct_slice = ct_image
                 current_voxel_volume = voxel_volume_mm3
+
+            del mask_nifti
 
             # Calculate statistics
             stats = calculate_vertebra_statistics(ct_slice, mask, current_voxel_volume)

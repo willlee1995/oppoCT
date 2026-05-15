@@ -26,6 +26,11 @@ weights_dir = project_root / "totalsegmentator_weights"
 if weights_dir.exists():
     datas.append((str(weights_dir), "totalsegmentator_weights"))
 
+totalseg_home = project_root / "totalsegmentator_home"
+totalseg_home_config = totalseg_home / "config.json"
+if totalseg_home_config.is_file():
+    datas.append((str(totalseg_home_config), "totalsegmentator_home"))
+
 readme_path = project_root / "README.md"
 if readme_path.exists():
     datas.append((str(readme_path), "."))
