@@ -44,6 +44,16 @@ def main() -> None:
         default="cpu",
         help="Device used for the small dummy inference.",
     )
+    parser.add_argument(
+        "--skip-full",
+        action="store_true",
+        help="Do not run full-resolution total (291–295); only fast total (297) and other tasks.",
+    )
+    parser.add_argument(
+        "--skip-fast",
+        action="store_true",
+        help="Do not run fast total (297); only full-resolution total (291–295) and other tasks.",
+    )
     args = parser.parse_args()
 
     weights_dir = args.weights_dir.resolve()
@@ -66,15 +76,30 @@ def main() -> None:
     nib.save(nib.Nifti1Image(np.zeros((32, 32, 32), dtype=np.float32), np.eye(4)), dummy_path)
 
     try:
-        logger.info("Triggering total task weights for lumbar vertebrae...")
-        totalsegmentator(
-            input=dummy_path,
-            output=total_out,
-            task="total",
-            roi_subset=LUMBAR_VERTEBRAE,
-            device=args.device,
-            preview=False,
-        )
+        if not args.skip_full:
+            logger.info("Triggering full-resolution total task weights (291–295 + 298)...")
+            totalsegmentator(
+                input=dummy_path,
+                output=total_out,
+                task="total",
+                roi_subset=LUMBAR_VERTEBRAE,
+                fast=False,
+                device=args.device,
+                preview=False,
+            )
+
+        if not args.skip_fast:
+            fast_out = work_dir / "total_out_fast"
+            logger.info("Triggering fast total task weights (Dataset297 + 298)...")
+            totalsegmentator(
+                input=dummy_path,
+                output=fast_out,
+                task="total",
+                roi_subset=LUMBAR_VERTEBRAE,
+                fast=True,
+                device=args.device,
+                preview=False,
+            )
 
         logger.info("Triggering vertebrae_body task weights...")
         try:

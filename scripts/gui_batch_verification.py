@@ -319,9 +319,67 @@ CSV_COLUMNS = [
     "L5 Source",
 ]
 
-TERMINAL_SEGMENTATION_STATUSES = {"not checked", "success", "failed", "not applicable"}
-QC_STATUSES = ["All", "Not Checked", "Success", "Failed", "Not Applicable", "Failed Pipeline"]
+TERMINAL_SEGMENTATION_STATUSES = {"not checked", "success", "failed", "not applicable", "shifted"}
+QC_STATUSES = ["All", "Not Checked", "Success", "Failed", "Shifted", "Not Applicable", "Failed Pipeline"]
 VERTEBRA_LABELS = ["T11", "T12", "L1", "L2", "L3", "L4", "L5"]
+# Traceability for fast TotalSegmentator (Dataset297) without a new CSV column.
+SEG_DURATION_FAST_SUFFIX = "fast"
+
+
+def format_segmentation_duration(seconds: float, *, fast_segmentation: bool) -> str:
+    """Encode duration and optional fast-mode flag in ``segmentation_duration_seconds``."""
+    base = f"{seconds:.2f}"
+    if fast_segmentation:
+        return f"{base}|{SEG_DURATION_FAST_SUFFIX}"
+    return base
+
+
+def parse_segmentation_duration(value: str) -> Tuple[Optional[float], Optional[bool]]:
+    """
+    Parse ``segmentation_duration_seconds``.
+
+    Returns (seconds, fast_used). ``fast_used`` is None when the field is empty or legacy (no suffix).
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None, None
+    if "|" in raw:
+        duration_part, flag_part = raw.split("|", 1)
+        fast_used = flag_part.strip().lower() == SEG_DURATION_FAST_SUFFIX
+        try:
+            return float(duration_part.strip()), fast_used
+        except ValueError:
+            return None, fast_used
+    try:
+        return float(raw), None
+    except ValueError:
+        return None, None
+
+
+def fast_segmentation_from_row(row: Dict[str, str]) -> Optional[bool]:
+    """Return True/False if encoded in the row, else None (not segmented or legacy row)."""
+    _duration, fast_used = parse_segmentation_duration(row.get("segmentation_duration_seconds", ""))
+    return fast_used
+
+
+QC_FAST_STATUS_SUFFIX = " (fast)"
+_QC_STATUSES_WITH_FAST_TAG = frozenset({"success", "failed", "shifted"})
+
+
+def qc_status_base(status: str) -> str:
+    """Normalize QC status for filters (strip optional `` (fast)`` suffix)."""
+    s = (status or "").strip().lower()
+    if s.endswith(QC_FAST_STATUS_SUFFIX):
+        return s[: -len(QC_FAST_STATUS_SUFFIX)].strip()
+    return s
+
+
+def format_qc_status(base_status: str, row: Dict[str, str]) -> str:
+    """Return e.g. ``success (fast)`` when this case was segmented with fast mode."""
+    base = (base_status or "").strip().lower()
+    if fast_segmentation_from_row(row) is True and base in _QC_STATUSES_WITH_FAST_TAG:
+        return f"{base}{QC_FAST_STATUS_SUFFIX}"
+    return base
 
 
 def _now() -> str:
@@ -583,6 +641,7 @@ def process_segmentation_row(
         row["status"] = "not checked"
         row["error"] = ""
         row["was_skipped"] = "true"
+        # No |fast suffix: outputs already existed; mode used originally is unknown.
         row["segmentation_duration_seconds"] = f"{time.perf_counter() - start_time:.2f}"
         row["updated_at"] = _now()
         return row
@@ -610,7 +669,9 @@ def process_segmentation_row(
     row["status"] = "not checked"
     row["error"] = ""
     row["was_skipped"] = "false"
-    row["segmentation_duration_seconds"] = f"{time.perf_counter() - start_time:.2f}"
+    row["segmentation_duration_seconds"] = format_segmentation_duration(
+        time.perf_counter() - start_time, fast_segmentation=fast_segmentation
+    )
     row["updated_at"] = _now()
     return row
 
@@ -618,9 +679,9 @@ def process_segmentation_row(
 def apply_verification_result(row: Dict[str, str], result: Dict) -> Dict[str, str]:
     is_successful = result.get("is_successful")
     if is_successful is True:
-        row["status"] = "success"
+        row["status"] = format_qc_status("success", row)
     elif is_successful is False:
-        row["status"] = "failed"
+        row["status"] = format_qc_status("failed", row)
     else:
         row["status"] = "not checked"
 
@@ -659,6 +720,8 @@ class BatchVerificationApp:
         self.sp_rows: List[Dict[str, str]] = []
         self.sp_series_items: List[Dict[str, object]] = []
         self._w2_cuda_check_running = False
+        self._w2_segmentation_running = False
+        self._w2_stop_requested = False
         self._w2_gui_log = None  # set in _create_segmentation_frame
         self.w3_csv_path: Optional[Path] = None
         self.w3_rows: List[Dict[str, str]] = []
@@ -1309,8 +1372,16 @@ class BatchVerificationApp:
             justify=tk.LEFT,
         ).pack(fill="x", pady=(6, 0))
 
-        self.w2_start_button = ttk.Button(frame, text="Start Batch Segmentation", command=self.w2_start)
-        self.w2_start_button.pack(pady=10)
+        run_buttons = ttk.Frame(frame)
+        run_buttons.pack(pady=10)
+        self.w2_start_button = ttk.Button(
+            run_buttons, text="Start Batch Segmentation", command=self.w2_start
+        )
+        self.w2_start_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.w2_stop_button = ttk.Button(
+            run_buttons, text="Stop Segmentation", command=self.w2_stop, state=tk.DISABLED
+        )
+        self.w2_stop_button.pack(side=tk.LEFT)
 
         progress = ttk.LabelFrame(frame, text="Progress", padding=10)
         progress.pack(fill="both", expand=True)
@@ -1399,7 +1470,26 @@ class BatchVerificationApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _w2_set_running(self, running: bool) -> None:
+        self._w2_segmentation_running = running
+        if running:
+            self._w2_stop_requested = False
+            self.w2_start_button.config(state=tk.DISABLED)
+            self.w2_stop_button.config(state=tk.NORMAL)
+        else:
+            self.w2_start_button.config(state=tk.NORMAL)
+            self.w2_stop_button.config(state=tk.DISABLED)
+
+    def w2_stop(self) -> None:
+        if not self._w2_segmentation_running:
+            return
+        self._w2_stop_requested = True
+        self.w2_stop_button.config(state=tk.DISABLED)
+        self.w2_log("Stop requested — will stop after the current study finishes.")
+
     def w2_start(self) -> None:
+        if self._w2_segmentation_running:
+            return
         csv_path = Path(self.w2_csv_var.get())
         if not csv_path.exists():
             messagebox.showerror("Invalid CSV", "Choose a valid batch CSV.")
@@ -1424,7 +1514,7 @@ class BatchVerificationApp:
 
         output_override = self.w2_output_override_var.get().strip()
         override_path = Path(output_override) if output_override else None
-        self.w2_start_button.config(state=tk.DISABLED)
+        self._w2_set_running(True)
         self.w2_progress_var.set(0)
         if self._w2_gui_log is not None:
             session_log = self._w2_gui_log.start_session(csv_path)
@@ -1450,6 +1540,7 @@ class BatchVerificationApp:
         old_stdout, old_stderr = sys.stdout, sys.stderr
         log_handler: Optional[_GuiLogHandler] = None
         show_completion_dialog = False
+        stopped_by_user = False
         try:
             sys.stdout = _TeeTextStream(old_stdout, gui_stream)
             sys.stderr = _TeeTextStream(old_stderr, gui_stream)
@@ -1461,7 +1552,7 @@ class BatchVerificationApp:
                 rows = read_csv_rows(csv_path)
             except Exception as exc:
                 self.root.after(0, lambda: messagebox.showerror("Read Failed", str(exc)))
-                self.root.after(0, self.w2_start_button.config, {"state": tk.NORMAL})
+                self.root.after(0, self._w2_set_running, False)
                 return
 
             pending: List[Tuple[int, Dict[str, str]]] = []
@@ -1481,6 +1572,12 @@ class BatchVerificationApp:
                 pending.append((idx, row))
 
             total = len(pending)
+            mode_label = "fast (Dataset297)" if fast_segmentation else "full (Datasets 291–295)"
+            self.root.after(
+                0,
+                self.w2_log,
+                f"Segmentation mode: {mode_label}.",
+            )
             self.root.after(
                 0,
                 self.w2_log,
@@ -1535,7 +1632,7 @@ class BatchVerificationApp:
                 except Exception as exc:
                     logger.exception("Failed to sync CSV for existing segmentations")
                     self.root.after(0, lambda: messagebox.showerror("Save Failed", str(exc)))
-                    self.root.after(0, self.w2_start_button.config, {"state": tk.NORMAL})
+                    self.root.after(0, self._w2_set_running, False)
                     return
                 self.root.after(
                     0,
@@ -1545,6 +1642,9 @@ class BatchVerificationApp:
 
             temp_dir = Path(tempfile.mkdtemp(prefix="oppoct_batch_gui_"))
             for count, (idx, row) in enumerate(pending, 1):
+                if self._w2_stop_requested:
+                    stopped_by_user = True
+                    break
                 label = row.get("patient_id") or row.get("dicom_folder", f"row {idx}")
                 self.root.after(0, self.w2_status_var.set, f"Study: {count} / {total}")
                 self.root.after(0, self.w2_progress_var.set, ((count - 1) / max(total, 1)) * 100)
@@ -1557,7 +1657,13 @@ class BatchVerificationApp:
                     write_csv_rows(csv_path, rows)
                     skipped = rows[idx].get("was_skipped") == "true"
                     suffix = "existing segmentation" if skipped else "new segmentation"
-                    self.root.after(0, self.w2_log, f"Finished {label} ({suffix})")
+                    fast_flag = fast_segmentation_from_row(rows[idx])
+                    fast_note = (
+                        ", fast mode"
+                        if fast_flag is True
+                        else (", full mode" if fast_flag is False else "")
+                    )
+                    self.root.after(0, self.w2_log, f"Finished {label} ({suffix}{fast_note})")
                 except Exception as exc:
                     logger.exception("Segmentation failed for %s", label)
                     rows[idx]["status"] = "failed_pipeline"
@@ -1566,10 +1672,20 @@ class BatchVerificationApp:
                     write_csv_rows(csv_path, rows)
                     self.root.after(0, self.w2_log, f"ERROR {label}: {exc}")
 
-            self.root.after(0, self.w2_progress_var.set, 100)
-            self.root.after(0, self.w2_status_var.set, f"Study: {total} / {total}")
-            self.root.after(0, self.w2_log, "Batch segmentation complete.")
-            show_completion_dialog = True
+            if stopped_by_user:
+                completed = count - 1 if total else 0
+                self.root.after(
+                    0,
+                    self.w2_progress_var.set,
+                    (completed / max(total, 1)) * 100,
+                )
+                self.root.after(0, self.w2_status_var.set, f"Study: {completed} / {total} (stopped)")
+                self.root.after(0, self.w2_log, "Batch segmentation stopped.")
+            else:
+                self.root.after(0, self.w2_progress_var.set, 100)
+                self.root.after(0, self.w2_status_var.set, f"Study: {total} / {total}")
+                self.root.after(0, self.w2_log, "Batch segmentation complete.")
+                show_completion_dialog = True
         finally:
             if log_handler is not None:
                 try:
@@ -1587,7 +1703,7 @@ class BatchVerificationApp:
                 pass
             gui_stream.flush()
 
-        self.root.after(0, self.w2_start_button.config, {"state": tk.NORMAL})
+        self.root.after(0, self._w2_set_running, False)
         if show_completion_dialog:
             log_hint = ""
             if self._w2_gui_log is not None and self._w2_gui_log.session_path is not None:
@@ -1595,6 +1711,17 @@ class BatchVerificationApp:
             self.root.after(
                 0,
                 lambda: messagebox.showinfo("Done", f"Batch segmentation complete.{log_hint}"),
+            )
+        elif stopped_by_user:
+            log_hint = ""
+            if self._w2_gui_log is not None and self._w2_gui_log.session_path is not None:
+                log_hint = f"\n\nFull log:\n{self._w2_gui_log.session_path}"
+            self.root.after(
+                0,
+                lambda: messagebox.showinfo(
+                    "Stopped",
+                    f"Batch segmentation stopped. Remaining studies were not processed.{log_hint}",
+                ),
             )
 
     def _create_qc_frame(self) -> None:
@@ -1656,10 +1783,14 @@ class BatchVerificationApp:
             actions, text="Mark Not Applicable", command=self.w3_mark_not_applicable, state=tk.DISABLED
         )
         self.w3_na_button.pack(side=tk.LEFT, padx=5)
+        self.w3_shifted_button = ttk.Button(
+            actions, text="Mark Shifted", command=self.w3_mark_shifted, state=tk.DISABLED
+        )
+        self.w3_shifted_button.pack(side=tk.LEFT, padx=5)
 
         hint = ttk.Label(
             right,
-            text="Mark Pass/Fail updates the CSV immediately. Open Viewer to review slices and capture HU metrics.",
+            text="Mark Pass/Fail/Shifted/NA updates the CSV immediately. Open Viewer to review slices and capture HU metrics.",
             wraplength=560,
         )
         hint.pack(anchor="w", pady=(0, 4))
@@ -1690,13 +1821,13 @@ class BatchVerificationApp:
 
         def sort_key(item: Tuple[int, Dict[str, str]]) -> Tuple[int, str]:
             _, row = item
-            status = row.get("status", "pending").lower()
-            priority = 0 if status == "not checked" else 1
+            status_base = qc_status_base(row.get("status", "pending"))
+            priority = 0 if status_base == "not checked" else 1
             return priority, row.get("patient_id", "")
 
         for original_idx, row in sorted(enumerate(self.w3_rows), key=sort_key):
             status = row.get("status", "pending").lower()
-            if selected_filter != "all" and selected_filter != status:
+            if selected_filter != "all" and selected_filter != qc_status_base(status):
                 continue
             label = f"[{status.upper()}] {row.get('patient_id', '')} | {row.get('exam_date', '')}"
             self.w3_cases.insert(tk.END, label)
@@ -1706,6 +1837,7 @@ class BatchVerificationApp:
         self.w3_fail_button.config(state=tk.DISABLED)
         self.w3_open_button.config(state=tk.DISABLED)
         self.w3_na_button.config(state=tk.DISABLED)
+        self.w3_shifted_button.config(state=tk.DISABLED)
 
     def w3_selected_original_index(self) -> Optional[int]:
         selection = self.w3_cases.curselection()
@@ -1719,12 +1851,29 @@ class BatchVerificationApp:
             return
         row = self.w3_rows[idx]
 
+        duration_s, fast_used = parse_segmentation_duration(
+            row.get("segmentation_duration_seconds", "")
+        )
+        if fast_used is True:
+            seg_mode = "fast (Dataset297)"
+        elif fast_used is False:
+            seg_mode = "full (Datasets 291–295)"
+        elif duration_s is not None:
+            seg_mode = "unknown (legacy row, no mode suffix)"
+        else:
+            seg_mode = "not recorded"
+        duration_display = (
+            f"{duration_s:.2f} s" if duration_s is not None else row.get("segmentation_duration_seconds", "")
+        )
+
         details = [
             f"Case ID: {row.get('case_id', '')}",
             f"Patient ID: {row.get('patient_id', '')}",
             f"Patient Name: {row.get('patient_name', '')}",
             f"Exam Date: {row.get('exam_date', '')}",
             f"Status: {row.get('status', '')}",
+            f"Segmentation mode: {seg_mode}",
+            f"Segmentation duration: {duration_display}",
             f"SeriesInstanceUID (segmentation): {row.get('series_instance_uid', '')}",
             f"Series description: {row.get('series_description', '')}",
             f"DICOM Folder: {row.get('dicom_folder', '')}",
@@ -1741,6 +1890,7 @@ class BatchVerificationApp:
         self.w3_fail_button.config(state=tk.NORMAL)
         self.w3_open_button.config(state=tk.NORMAL)
         self.w3_na_button.config(state=tk.NORMAL)
+        self.w3_shifted_button.config(state=tk.NORMAL)
 
     def _w3_show_viewer_loading_dialog(self, row: Dict[str, str]) -> tk.Toplevel:
         patient_label = row.get("patient_id") or row.get("patient_name") or "selected case"
@@ -1847,6 +1997,9 @@ class BatchVerificationApp:
     def w3_mark_not_applicable(self) -> None:
         self._w3_write_qc_status("not applicable", "Case marked not applicable.")
 
+    def w3_mark_shifted(self) -> None:
+        self._w3_write_qc_status("shifted", "Case marked shifted.")
+
     def w3_mark_pass(self) -> None:
         self._w3_write_qc_status("success", "Case marked pass (success).")
 
@@ -1860,11 +2013,14 @@ class BatchVerificationApp:
         if idx is None:
             return
 
-        self.w3_rows[idx]["status"] = status
+        final_status = format_qc_status(status, self.w3_rows[idx])
+        self.w3_rows[idx]["status"] = final_status
         self.w3_rows[idx]["updated_at"] = _now()
         self.w3_rows[idx]["error"] = ""
         write_csv_rows(self.w3_csv_path, self.w3_rows)
         self.w3_refresh_list()
+        if final_status != status:
+            saved_message = f"{saved_message.rstrip('.')}: {final_status}."
         messagebox.showinfo("Saved", saved_message)
 
 

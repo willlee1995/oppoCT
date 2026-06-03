@@ -144,9 +144,14 @@ This GUI is an orchestration layer only. It reuses the existing segmentation pip
 
 ### PyInstaller Batch GUI Build
 
-For a portable Windows onedir package, download the model weights before building:
+For a portable Windows onedir package, download the model weights before building (full 291–295, fast 297, roi crop 298, and optional vertebrae_body 305):
 ```bash
 python download_weights_lumbar.py --weights-dir totalsegmentator_weights --device cpu
+```
+
+To fetch only the fast 3 mm model (Dataset297) when the full five-part weights are already present:
+```bash
+python download_weights_lumbar.py --weights-dir totalsegmentator_weights --device cpu --skip-full
 ```
 
 Then build the batch GUI package:
