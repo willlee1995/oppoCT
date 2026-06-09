@@ -7,6 +7,7 @@ pipeline and verification viewer without modifying them.
 
 from __future__ import annotations
 
+import gc
 import logging
 import sys
 import tempfile
@@ -32,6 +33,8 @@ from batch_verification import (  # noqa: E402
     check_segmentations_exist,
     load_ct_for_verification,
     load_masks_for_verification,
+    log_memory_checkpoint,
+    log_viewer_array_memory,
 )
 from src.dicom_network import (  # noqa: E402
     DicomScpConfig,
@@ -740,15 +743,22 @@ class SingleCaseWorkflowApp:
             messagebox.showerror("Missing Segmentation", f"No segmentation masks found:\n{case.segmentation_dir}")
             return
 
+        viewer = None
+        ct_volume = None
+        ct_img = None
+        masks = {}
         try:
             self.status_var.set("Loading QC viewer...")
             self.root.update_idletasks()
+            log_memory_checkpoint("before single-case viewer load")
             ct_volume, ct_img = load_ct_for_verification(
                 case.dicom_folder,
                 case.segmentation_dir,
                 series_instance_uid=(case.series_instance_uid or None),
             )
             masks = load_masks_for_verification(case.segmentation_dir, ct_img)
+            log_viewer_array_memory(ct_volume, masks)
+            log_memory_checkpoint("after single-case viewer load")
             viewer = VerificationViewer(
                 ct_volume=ct_volume,
                 masks=masks,
@@ -763,6 +773,12 @@ class SingleCaseWorkflowApp:
             self.log(f"QC viewer failed: {exc}")
             messagebox.showerror("QC Failed", str(exc))
             return
+        finally:
+            if viewer is not None:
+                viewer.close()
+            del viewer, ct_volume, ct_img, masks
+            gc.collect()
+            log_memory_checkpoint("after single-case viewer close")
 
         case.qc_result = result
         if result.get("is_successful") is True:

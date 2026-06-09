@@ -2,10 +2,12 @@
 Tkinter batch workflow for CSV-driven segmentation and verification.
 
 Steps: (1) create batch CSV from DICOM folders, (2) load CSV and assign a DICOM series
-per study row, (3) run batch segmentation, (4) verify and update QC columns in the CSV.
+per study row, (3) run batch segmentation, (4) check trabecular core outputs and flag
+incomplete cases, (5) verify and update QC columns in the CSV.
 
 This module intentionally orchestrates existing pipeline and viewer code only:
 - segmentation is delegated to src.pipeline.process_single_patient()
+- trabecular core checks use batch_verification.assess_trabecular_core()
 - verification uses batch_verification.VerificationViewer and its loaders unchanged
 """
 
@@ -18,6 +20,7 @@ import matplotlib
 matplotlib.use("TkAgg", force=True)
 
 import csv
+import gc
 import json
 import logging
 import os
@@ -41,9 +44,13 @@ for path in (PROJECT_ROOT, SCRIPTS_DIR):
 
 from batch_verification import (  # noqa: E402
     VerificationViewer,
+    assess_trabecular_core,
     check_segmentations_exist,
     load_ct_for_verification,
     load_masks_for_verification,
+    log_memory_checkpoint,
+    log_viewer_array_memory,
+    segmentation_outputs_complete,
 )
 from src.dicom_processor import enumerate_dicom_series  # noqa: E402
 from src.patient_manager import get_patient_metadata, normalize_patient_id  # noqa: E402
@@ -364,6 +371,7 @@ def fast_segmentation_from_row(row: Dict[str, str]) -> Optional[bool]:
 
 QC_FAST_STATUS_SUFFIX = " (fast)"
 _QC_STATUSES_WITH_FAST_TAG = frozenset({"success", "failed", "shifted"})
+TRABECULAR_CORE_ERROR_PREFIX = "Missing trabecular core:"
 
 
 def qc_status_base(status: str) -> str:
@@ -637,7 +645,7 @@ def process_segmentation_row(
     row["segmentation_dir"] = str(segmentation_dir)
 
     start_time = time.perf_counter()
-    if check_segmentations_exist(segmentation_dir):
+    if segmentation_outputs_complete(segmentation_dir):
         row["status"] = "not checked"
         row["error"] = ""
         row["was_skipped"] = "true"
@@ -723,6 +731,7 @@ class BatchVerificationApp:
         self._w2_segmentation_running = False
         self._w2_stop_requested = False
         self._w2_gui_log = None  # set in _create_segmentation_frame
+        self._w4_check_running = False
         self.w3_csv_path: Optional[Path] = None
         self.w3_rows: List[Dict[str, str]] = []
         self.w3_display_indices: List[int] = []
@@ -733,6 +742,7 @@ class BatchVerificationApp:
         self._create_list_frame()
         self._create_select_series_frame()
         self._create_segmentation_frame()
+        self._create_seg_check_frame()
         self._create_qc_frame()
         self.show_frame("main")
 
@@ -771,7 +781,13 @@ class BatchVerificationApp:
         ).pack(fill="x", padx=120, pady=10)
         ttk.Button(
             frame,
-            text="4. Verify And Mark CSV",
+            text="4. Check Trabecular Core",
+            style="Menu.TButton",
+            command=lambda: self.show_frame("seg_check"),
+        ).pack(fill="x", padx=120, pady=10)
+        ttk.Button(
+            frame,
+            text="5. Verify And Mark CSV",
             style="Menu.TButton",
             command=lambda: self.show_frame("qc"),
         ).pack(fill="x", padx=120, pady=10)
@@ -1353,8 +1369,9 @@ class BatchVerificationApp:
         )
         ttk.Label(
             config,
-            text="Only rows with series_instance_uid (workflow 2) and without existing segmentation "
-            "outputs under the output path are processed.",
+            text="Only rows with series_instance_uid (workflow 2) and without complete segmentation "
+            "(non-empty L1 trabecular core) are processed. Use workflow 4 to flag incomplete cases; "
+            "enable Retry failed_pipeline rows to re-segment them.",
             wraplength=780,
             justify=tk.LEFT,
         ).grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=(6, 0))
@@ -1566,9 +1583,13 @@ class BatchVerificationApp:
                     skipped_no_series += 1
                     continue
                 _, _ob, _pod, segmentation_dir = segmentation_output_paths_for_row(row, output_override)
-                if check_segmentations_exist(segmentation_dir):
+                if segmentation_outputs_complete(segmentation_dir):
                     skipped_seg_done += 1
                     continue
+                if check_segmentations_exist(segmentation_dir):
+                    if not (retry_failed and status == "failed_pipeline"):
+                        skipped_seg_done += 1
+                        continue
                 pending.append((idx, row))
 
             total = len(pending)
@@ -1581,7 +1602,7 @@ class BatchVerificationApp:
             self.root.after(
                 0,
                 self.w2_log,
-                f"Found {total} case(s) to segment (series selected, segmentation outputs not present yet).",
+                f"Found {total} case(s) to segment (series selected, trabecular core not present yet).",
             )
             if skipped_no_series:
                 self.root.after(
@@ -1594,7 +1615,7 @@ class BatchVerificationApp:
                 self.root.after(
                     0,
                     self.w2_log,
-                    f"Skipping {skipped_seg_done} row(s) that already have segmentations on disk.",
+                    f"Skipping {skipped_seg_done} row(s) that already have complete segmentations on disk.",
                 )
             if total == 0:
                 if skipped_no_series or skipped_seg_done:
@@ -1613,7 +1634,7 @@ class BatchVerificationApp:
                 if not (row.get("series_instance_uid") or "").strip():
                     continue
                 _, _ob, _pod, seg_dir = segmentation_output_paths_for_row(row, output_override)
-                if not check_segmentations_exist(seg_dir):
+                if not segmentation_outputs_complete(seg_dir):
                     continue
                 start_sync = time.perf_counter()
                 rows[idx]["output_base_dir"] = str(_ob)
@@ -1637,7 +1658,7 @@ class BatchVerificationApp:
                 self.root.after(
                     0,
                     self.w2_log,
-                    f"Updated {sync_count} CSV row(s) to not checked (segmentation files already on disk).",
+                    f"Updated {sync_count} CSV row(s) to not checked (complete segmentation files already on disk).",
                 )
 
             temp_dir = Path(tempfile.mkdtemp(prefix="oppoct_batch_gui_"))
@@ -1648,7 +1669,20 @@ class BatchVerificationApp:
                 label = row.get("patient_id") or row.get("dicom_folder", f"row {idx}")
                 self.root.after(0, self.w2_status_var.set, f"Study: {count} / {total}")
                 self.root.after(0, self.w2_progress_var.set, ((count - 1) / max(total, 1)) * 100)
-                self.root.after(0, self.w2_log, f"Processing {label}")
+                _, _, _, seg_dir = segmentation_output_paths_for_row(row, output_override)
+                if (
+                    retry_failed
+                    and row.get("status", "").lower() == "failed_pipeline"
+                    and check_segmentations_exist(seg_dir)
+                    and not segmentation_outputs_complete(seg_dir)
+                ):
+                    self.root.after(
+                        0,
+                        self.w2_log,
+                        f"Re-segmenting incomplete outputs (trabecular core missing): {label}",
+                    )
+                else:
+                    self.root.after(0, self.w2_log, f"Processing {label}")
 
                 try:
                     rows[idx] = process_segmentation_row(
@@ -1724,11 +1758,196 @@ class BatchVerificationApp:
                 ),
             )
 
+    def _create_seg_check_frame(self) -> None:
+        frame = ttk.Frame(self.root, padding=10)
+        self.frames["seg_check"] = frame
+
+        ttk.Label(frame, text="Workflow 4: Check Trabecular Core", font=("Helvetica", 14, "bold")).pack(
+            pady=5
+        )
+        ttk.Button(frame, text="Back to Main Menu", command=lambda: self.show_frame("main")).pack(
+            anchor="nw", pady=5
+        )
+
+        config = ttk.LabelFrame(frame, text="Configuration", padding=10)
+        config.pack(fill="x", pady=5)
+
+        self.w4_csv_var = tk.StringVar()
+        self.w4_output_override_var = tk.StringVar()
+
+        ttk.Label(config, text="Batch CSV:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
+        ttk.Entry(config, textvariable=self.w4_csv_var, width=70).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Button(config, text="Browse", command=self.w4_browse_csv).grid(row=0, column=2, padx=5)
+
+        ttk.Label(config, text="Output override:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        ttk.Entry(config, textvariable=self.w4_output_override_var, width=70).grid(
+            row=1, column=1, padx=5, pady=2
+        )
+        ttk.Button(config, text="Browse", command=self.w4_browse_output).grid(row=1, column=2, padx=5)
+
+        ttk.Label(
+            config,
+            text="Scans each row for a non-empty vertebrae_L1_body_trabecular_core.nii.gz mask. "
+            "Missing or empty cores are marked failed_pipeline. After re-segmentation in workflow 3 "
+            "(Retry failed_pipeline rows), run this check again to clear flagged rows.",
+            wraplength=780,
+            justify=tk.LEFT,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=5, pady=(6, 0))
+
+        run_buttons = ttk.Frame(frame)
+        run_buttons.pack(pady=10)
+        self.w4_start_button = ttk.Button(
+            run_buttons, text="Run Trabecular Core Check", command=self.w4_start
+        )
+        self.w4_start_button.pack(side=tk.LEFT)
+
+        progress = ttk.LabelFrame(frame, text="Progress", padding=10)
+        progress.pack(fill="both", expand=True)
+
+        self.w4_status_var = tk.StringVar(value="Case: 0 / 0")
+        ttk.Label(progress, textvariable=self.w4_status_var).pack(anchor="w")
+
+        self.w4_summary_var = tk.StringVar(value="Summary: not run yet")
+        ttk.Label(progress, textvariable=self.w4_summary_var, wraplength=900, justify=tk.LEFT).pack(
+            anchor="w", pady=(4, 0)
+        )
+
+        self.w4_progress_var = tk.DoubleVar()
+        ttk.Progressbar(progress, variable=self.w4_progress_var, maximum=100).pack(fill="x", pady=5)
+
+        self.w4_log_text = tk.Text(progress, height=18, state=tk.DISABLED)
+        self.w4_log_text.pack(fill="both", expand=True)
+
+    def w4_browse_csv(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
+        if path:
+            self.w4_csv_var.set(path)
+
+    def w4_browse_output(self) -> None:
+        folder = filedialog.askdirectory()
+        if folder:
+            self.w4_output_override_var.set(folder)
+
+    def w4_log(self, message: str) -> None:
+        if not message:
+            return
+        self.w4_log_text.config(state=tk.NORMAL)
+        self.w4_log_text.insert(tk.END, message + "\n")
+        self.w4_log_text.see(tk.END)
+        self.w4_log_text.config(state=tk.DISABLED)
+
+    def _w4_set_running(self, running: bool) -> None:
+        self._w4_check_running = running
+        self.w4_start_button.config(state=tk.DISABLED if running else tk.NORMAL)
+
+    def w4_start(self) -> None:
+        if self._w4_check_running:
+            return
+        csv_path = Path(self.w4_csv_var.get())
+        if not csv_path.exists():
+            messagebox.showerror("Invalid CSV", "Choose a valid batch CSV.")
+            return
+
+        output_override = self.w4_output_override_var.get().strip()
+        override_path = Path(output_override) if output_override else None
+
+        self._w4_set_running(True)
+        self.w4_progress_var.set(0)
+        self.w4_log_text.config(state=tk.NORMAL)
+        self.w4_log_text.delete("1.0", tk.END)
+        self.w4_log_text.config(state=tk.DISABLED)
+        self.w4_summary_var.set("Summary: running…")
+
+        threading.Thread(
+            target=self._run_seg_check_thread,
+            args=(csv_path, override_path),
+            daemon=True,
+        ).start()
+
+    def _run_seg_check_thread(self, csv_path: Path, output_override: Optional[Path]) -> None:
+        show_completion_dialog = False
+        summary_text = "Summary: check failed"
+        flagged_count = 0
+        cleared_count = 0
+        ok_count = 0
+
+        try:
+            try:
+                rows = read_csv_rows(csv_path)
+            except Exception as exc:
+                self.root.after(0, lambda: messagebox.showerror("Read Failed", str(exc)))
+                return
+
+            total = len(rows)
+            for idx, row in enumerate(rows):
+                count = idx + 1
+                label = row.get("patient_id") or row.get("dicom_folder", f"row {idx}")
+                self.root.after(0, self.w4_status_var.set, f"Case: {count} / {total}")
+                self.root.after(0, self.w4_progress_var.set, (count / max(total, 1)) * 100)
+
+                _, output_base_dir, patient_output_dir, segmentation_dir = segmentation_output_paths_for_row(
+                    row, output_override
+                )
+                rows[idx]["output_base_dir"] = str(output_base_dir)
+                rows[idx]["patient_output_dir"] = str(patient_output_dir)
+                rows[idx]["segmentation_dir"] = str(segmentation_dir)
+
+                ok, detail = assess_trabecular_core(segmentation_dir)
+                if ok:
+                    ok_count += 1
+                    prev_status = row.get("status", "").lower()
+                    prev_error = (row.get("error") or "").strip()
+                    if prev_status == "failed_pipeline" and prev_error.startswith(TRABECULAR_CORE_ERROR_PREFIX):
+                        rows[idx]["status"] = "not checked"
+                        rows[idx]["error"] = ""
+                        rows[idx]["was_skipped"] = ""
+                        rows[idx]["updated_at"] = _now()
+                        cleared_count += 1
+                        self.root.after(0, self.w4_log, f"OK (cleared failed_pipeline): {label}")
+                    else:
+                        self.root.after(0, self.w4_log, f"OK: {label}")
+                else:
+                    rows[idx]["status"] = "failed_pipeline"
+                    rows[idx]["error"] = f"{TRABECULAR_CORE_ERROR_PREFIX} {detail}"
+                    rows[idx]["was_skipped"] = ""
+                    rows[idx]["updated_at"] = _now()
+                    flagged_count += 1
+                    self.root.after(0, self.w4_log, f"FAILED: {label} — {detail}")
+
+                try:
+                    write_csv_rows(csv_path, rows)
+                except Exception as exc:
+                    logger.exception("Failed to write CSV during trabecular core check")
+                    self.root.after(0, lambda: messagebox.showerror("Save Failed", str(exc)))
+                    return
+
+            summary_text = (
+                f"Summary: {ok_count} ok, {flagged_count} marked failed_pipeline, "
+                f"{cleared_count} cleared after re-segmentation"
+            )
+            self.root.after(0, self.w4_summary_var.set, summary_text)
+            self.root.after(0, self.w4_log, summary_text)
+            show_completion_dialog = True
+        finally:
+            self.root.after(0, self._w4_set_running, False)
+
+        if show_completion_dialog:
+            if flagged_count:
+                body = (
+                    f"{flagged_count} case(s) marked failed_pipeline.\n\n"
+                    "Go to Workflow 3, enable Retry failed_pipeline rows, and re-segment."
+                )
+            else:
+                body = "All cases have a non-empty L1 trabecular core mask."
+            if cleared_count:
+                body += f"\n\n{cleared_count} previously flagged row(s) were cleared."
+            self.root.after(0, lambda: messagebox.showinfo("Trabecular Core Check", body))
+
     def _create_qc_frame(self) -> None:
         frame = ttk.Frame(self.root, padding=10)
         self.frames["qc"] = frame
 
-        ttk.Label(frame, text="Workflow 4: Verify And Mark CSV", font=("Helvetica", 14, "bold")).pack(pady=5)
+        ttk.Label(frame, text="Workflow 5: Verify And Mark CSV", font=("Helvetica", 14, "bold")).pack(pady=5)
         ttk.Button(frame, text="Back to Main Menu", command=lambda: self.show_frame("main")).pack(
             anchor="nw", pady=5
         )
@@ -1866,6 +2085,10 @@ class BatchVerificationApp:
             f"{duration_s:.2f} s" if duration_s is not None else row.get("segmentation_duration_seconds", "")
         )
 
+        segmentation_dir = Path(row.get("segmentation_dir", ""))
+        core_ok, core_detail = assess_trabecular_core(segmentation_dir)
+        core_status = "present" if core_ok else core_detail
+
         details = [
             f"Case ID: {row.get('case_id', '')}",
             f"Patient ID: {row.get('patient_id', '')}",
@@ -1878,6 +2101,7 @@ class BatchVerificationApp:
             f"Series description: {row.get('series_description', '')}",
             f"DICOM Folder: {row.get('dicom_folder', '')}",
             f"Segmentation Dir: {row.get('segmentation_dir', '')}",
+            f"Trabecular core: {core_status}",
             f"L1 Trabecular Core HU: {row.get('l1_trabecular_core_hu', '')}",
             f"Error: {row.get('error', '')}",
         ]
@@ -1951,14 +2175,21 @@ class BatchVerificationApp:
             return
 
         loading_dialog: Optional[tk.Toplevel] = None
+        viewer = None
+        ct_volume = None
+        ct_img = None
+        masks = {}
         try:
             self.w3_open_button.config(state=tk.DISABLED)
             loading_dialog = self._w3_show_viewer_loading_dialog(row)
             suid = (row.get("series_instance_uid") or "").strip() or None
+            log_memory_checkpoint("before batch GUI viewer load")
             ct_volume, ct_img = load_ct_for_verification(
                 dicom_folder, segmentation_dir, series_instance_uid=suid
             )
             masks = load_masks_for_verification(segmentation_dir, ct_img)
+            log_viewer_array_memory(ct_volume, masks)
+            log_memory_checkpoint("after batch GUI viewer load")
             viewer = VerificationViewer(
                 ct_volume=ct_volume,
                 masks=masks,
@@ -1993,6 +2224,11 @@ class BatchVerificationApp:
                 loading_dialog.destroy()
             if self.w3_selected_original_index() is not None:
                 self.w3_open_button.config(state=tk.NORMAL)
+            if viewer is not None:
+                viewer.close()
+            del viewer, ct_volume, ct_img, masks
+            gc.collect()
+            log_memory_checkpoint("after batch GUI viewer close")
 
     def w3_mark_not_applicable(self) -> None:
         self._w3_write_qc_status("not applicable", "Case marked not applicable.")
